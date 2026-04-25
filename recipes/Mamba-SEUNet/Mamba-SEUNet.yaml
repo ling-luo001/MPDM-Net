@@ -1,0 +1,236 @@
+## Environment Settings
+#(base) lz@lz-System-Product-Name:/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM$ conda activate mamba
+#(mamba) lz@lz-System-Product-Name:/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM$ python train.py
+#
+#[rank0]:   File "/home/lz/anaconda3/envs/mamba/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+#[rank0]:     return forward_call(*args, **kwargs)
+#[rank0]:   File "/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM/models/generator.py", line 412, in forward
+#[rank0]:     raise RuntimeError('pha_fused contains NaN/Inf')
+#[rank0]: RuntimeError: pha_fused contains NaN/Inf
+
+
+#class FFCM(nn.Module):
+#    def __init__(
+#            self,
+#            dim,
+#            token_mixer_for_gloal=Freq_Fusion,
+#            mixer_kernel_size=[1,3,5,7],
+#            local_size=8
+#    ):
+#        super(FFCM, self).__init__()
+#        self.dim = dim
+#        self.mixer_gloal = token_mixer_for_gloal(dim=self.dim, kernel_size=mixer_kernel_size,
+#                                 se_ratio=8, local_size=local_size)
+#
+#        # 修改：在卷积后添加 BatchNorm2d
+#        self.ca_conv = nn.Sequential(
+#            nn.Conv2d(2*dim, dim, 1),
+#            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, padding_mode='reflect'),
+#            nn.BatchNorm2d(dim),  # Added Norm: 防止数值过大
+#            nn.GELU()
+#        )
+#
+#        self.ca = nn.Sequential(
+#            nn.AdaptiveAvgPool2d(1),
+#            nn.Conv2d(dim, dim // 4, kernel_size=1),
+#            nn.GELU(),
+#            nn.Conv2d(dim // 4, dim, kernel_size=1),
+#            nn.Sigmoid()
+#        )
+#
+#        # 修改：在卷积后添加 BatchNorm2d
+#        self.conv_init = nn.Sequential(  # PW->DW->
+#            nn.Conv2d(dim, dim * 2, 1),
+#            nn.BatchNorm2d(dim * 2),  # Added Norm: 稳定初始特征分布
+#            nn.GELU()
+#        )
+#
+#        # 修改：在卷积后添加 BatchNorm2d
+#        self.dw_conv_1 = nn.Sequential(
+#            nn.Conv2d(self.dim, self.dim, kernel_size=3, padding=3 // 2,
+#                      groups=self.dim, padding_mode='reflect'),
+#            nn.BatchNorm2d(self.dim),  # Added Norm
+#            nn.GELU()
+#        )
+#
+#        # 修改：在卷积后添加 BatchNorm2d
+#        self.dw_conv_2 = nn.Sequential(
+#            nn.Conv2d(self.dim, self.dim, kernel_size=5, padding=5 // 2,
+#                      groups=self.dim, padding_mode='reflect'),
+#            nn.BatchNorm2d(self.dim),  # Added Norm
+#            nn.GELU()
+#        )
+#
+#    def forward(self, x):
+#        shortcut = x  # 保存输入用于残差连接
+#
+#        x = self.conv_init(x)
+#        x = list(torch.split(x, self.dim, dim=1))
+#
+#        x_local_1 = self.dw_conv_1(x[0])
+#        # 保持之前的修复：使用 x[1] 确保特征充分利用
+#        x_local_2 = self.dw_conv_2(x[1])
+#
+#        x_gloal = self.mixer_gloal(torch.cat([x_local_1, x_local_2], dim=1))
+#        x = self.ca_conv(x_gloal)
+#        x = self.ca(x) * x
+#
+#        return x + shortcut  # 保持残差连接
+#
+
+
+#Generator Parameters : 1896071
+#checkpoints directory : exp/Mamba_emb_basis_16_2_dual_tower_interaction_fuseMamba
+#Epoch: 1
+#[rank0]: Traceback (most recent call last):
+#[rank0]:   File "/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM/train.py", line 485, in <module>
+#[rank0]:     main()
+#[rank0]:   File "/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM/train.py", line 482, in main
+#[rank0]:     train(0, args, cfg)
+#[rank0]:   File "/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM/train.py", line 202, in train
+#[rank0]:     clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
+#[rank0]: ValueError: too many values to unpack (expected 6)
+
+# These settings specify the hardware and distributed setup for the model training.
+# Adjust `num_gpus` and `dist_config` according to your distributed training environment.
+#1896088  8176M
+env_setting:
+  num_gpus: 1  # Number of GPUs. Now we don't support CPU mode.
+  num_workers: 12  # Number of worker threads for data loading.
+  seed: 1234  # Seed for random number generators to ensure reproducibility.
+  stdout_interval: 200
+  checkpoint_interval: 2000  # save model to ckpt every N steps
+  validation_interval: 2000
+  summary_interval: 200
+  dist_cfg:
+    dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
+    dist_url: tcp://localhost:29501  # URL for initializing distributed training.
+    world_size: 1  # Total number of processes in the distributed training.
+
+# Datapath Configuratoin
+data_cfg:
+  train_clean_json: data/train_clean.json
+  train_noisy_json: data/train_noisy.json
+  valid_clean_json: data/valid_clean.json
+  valid_noisy_json: data/valid_noisy.json
+  test_clean_json: data/test_clean.json
+  test_noisy_json: data/test_noisy.json
+
+# Training Configuration
+# This section details parameters that directly influence the training process,
+# including batch sizes, learning rates, and optimizer specifics.
+training_cfg:
+  training_epochs: 400 # Training epoch.
+  batch_size: 2  # Training batch size.
+  learning_rate: 0.0005  # Initial learning rate.
+  adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
+  adam_b2: 0.99  # Beta2 hyperparameter for the AdamW optimizer.
+  lr_decay: 0.99  # Learning rate decay per epoch.
+  segment_size: 30600  # Audio segment size used during training, dependent on sampling rate.
+  loss:
+    metric: 0.05
+    magnitude: 0.9
+    phase: 0.3
+    complex: 0.1
+    time: 0.2
+    consistancy: 0.1
+  use_PCS400: False  # Use PCS or not
+
+# STFT Configuration
+# Configuration for Short-Time Fourier Transform (STFT), crucial for audio processing models.
+stft_cfg:
+  sampling_rate: 16000  # Audio sampling rate in Hz.
+  n_fft: 510  # FFT components for transforming audio signals.
+  hop_size: 120  # Samples between successive frames.
+  win_size: 510  # Window size used in FFT.
+
+# Model Configuration
+# Defines the architecture specifics of the model, including layer configurations and feature compression.
+model_cfg:
+  hid_feature: 16  # Channels in dense layers.
+  dense_channel : 16
+  compress_factor: 0.3  # Compression factor applied to extracted features.
+  num_tfmamba: 2  # Number of Time-Frequency Mamba (TFMamba) blocks in the model.
+  d_state: 16 # Dimensionality of the state vector in Mamba blocks.
+  d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
+  expand: 4  # Expansion factor for the layers within the Mamba blocks.
+  norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
+  beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
+  input_channel: 2 # Magnitude and Phase
+  output_channel: 1  # Single Channel Speech Enhancement
+  cross_pool_t: 2   # 时间下采样因子
+  cross_pool_f: 2   # 频率下采样因子
+  cross_sparse_window: 64   # 窗口大小，越小越快
+  cross_global_window: 8    # 头/尾全局 token
+  cross_sparsity: 0.9       # 稀疏率，越大越稀疏
+  num_mid_pairs : 3
+
+
+
+## Environment Settings
+## These settings specify the hardware and distributed setup for the model training.
+## Adjust `num_gpus` and `dist_config` according to your distributed training environment.
+#env_setting:
+#  num_gpus: 1  # Number of GPUs. Now we don't support CPU mode.
+#  num_workers: 12  # Number of worker threads for data loading.
+#  seed: 1234  # Seed for random number generators to ensure reproducibility.
+#  stdout_interval: 200
+#  checkpoint_interval: 2000  # save model to ckpt every N steps
+#  validation_interval: 2000
+#  summary_interval: 200
+#  dist_cfg:
+#    dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
+#    dist_url: tcp://localhost:13407  # URL for initializing distributed training.
+#    world_size: 1  # Total number of processes in the distributed training.
+#
+## Datapath Configuratoin
+#data_cfg:
+#  train_clean_json: data/train_clean.json
+#  train_noisy_json: data/train_noisy.json
+#  valid_clean_json: data/valid_clean.json
+#  valid_noisy_json: data/valid_noisy.json
+#  test_clean_json: data/test_clean.json
+#  test_noisy_json: data/test_noisy.json
+#
+## Training Configuration
+## This section details parameters that directly influence the training process,
+## including batch sizes, learning rates, and optimizer specifics.
+#training_cfg:
+#  training_epochs: 200 # Training epoch.
+#  batch_size: 2  # Training batch size.
+#  learning_rate: 0.0005  # Initial learning rate.
+#  adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
+#  adam_b2: 0.99  # Beta2 hyperparameter for the AdamW optimizer.
+#  lr_decay: 0.99  # Learning rate decay per epoch.
+#  segment_size: 30600  # Audio segment size used during training, dependent on sampling rate.
+#  loss:
+#    metric: 0.05
+#    magnitude: 0.9
+#    phase: 0.3
+#    complex: 0.1
+#    time: 0.2
+#    consistancy: 0.1
+#  use_PCS400: False  # Use PCS or not
+#
+## STFT Configuration
+## Configuration for Short-Time Fourier Transform (STFT), crucial for audio processing models.
+#stft_cfg:
+#  sampling_rate: 16000  # Audio sampling rate in Hz.
+#  n_fft: 510  # FFT components for transforming audio signals.
+#  hop_size: 120  # Samples between successive frames.
+#  win_size: 510  # Window size used in FFT.
+#
+## Model Configuration
+## Defines the architecture specifics of the model, including layer configurations and feature compression.
+#model_cfg:
+#  hid_feature: 32  # Channels in dense layers.
+#  dense_channel : 16
+#  compress_factor: 0.3  # Compression factor applied to extracted features.
+#  num_tfmamba: 4  # Number of Time-Frequency Mamba (TFMamba) blocks in the model.
+#  d_state: 16 # Dimensionality of the state vector in Mamba blocks.
+#  d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
+#  expand: 4  # Expansion factor for the layers within the Mamba blocks.
+#  norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
+#  beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
+#  input_channel: 2 # Magnitude and Phase
+#  output_channel: 1  # Single Channel Speech Enhancement
