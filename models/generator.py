@@ -255,44 +255,7 @@ class MambaSEUNet(nn.Module):
         self.pha_output = nn.Sequential(nn.Conv2d(pha_dim[0], pha_dim[0], 3, 1, 1, bias=False))
 
         # --- 5. 双流 VSS 融合模块 ---
-        # 1) 独立投影到高维 3H
-        self.mid_in_proj_mag = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(mag_dim[2], mag_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        self.mid_in_proj_pha = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(pha_dim[2], mag_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        # 2) VSS 交互（同维 3H）
-        self.mid_fusions = nn.ModuleList([VSSBlock_Cross_new(hidden_dim=mag_dim[2]) for _ in range(self.num_mid_stages)])
-        # 3) 融合后还原各自宽度
-        self.mid_fusion_proj_mag = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(mag_dim[2] * 2, mag_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        self.mid_fusion_proj_pha = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(pha_dim[2] + mag_dim[2], pha_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=pha_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        # 全局融合前将 Pha 提升到 Mag 宽度
-        self.global_in_proj_pha = nn.Sequential(
-            nn.Conv2d(pha_dim[0], mag_dim[0], 1, 1, 0, bias=False),
-            nn.GroupNorm(num_groups=1, num_channels=mag_dim[0])
-        )
-        self.global_fusion = VSSBlock_Cross_new(hidden_dim=mag_dim[0])
-        self.global_out_proj_pha = nn.Sequential(
-            nn.Conv2d(pha_dim[0] + mag_dim[0], pha_dim[0], 1, 1, 0, bias=False),
-            nn.GroupNorm(num_groups=1, num_channels=pha_dim[0])
-        )
+        # (Ablation) 去掉瓶颈层与全局跨域交互，双塔独立运行
 
         # --- 4. 最终解码器 ---
         self.mag_to_mask_proj = nn.Conv2d(mag_dim[0], mag_base, 1, 1, 0, bias=False)
@@ -338,7 +301,6 @@ class MambaSEUNet(nn.Module):
         mag_x3 = self.mag_patch_embed_middle(mag_x3)
         mag_fm_blocks = self.mag_FM_middle
         mag_tm_blocks = self.mag_TM_middle
-        mag_prev = mag_x3
 
         # ---------------------------
         # Phase Tower Encoder (RI input)
@@ -363,10 +325,9 @@ class MambaSEUNet(nn.Module):
         pha_x3 = self.pha_patch_embed_middle(pha_x3)
         pha_tm_blocks = self.pha_TM_middle
         pha_fm_blocks = self.pha_FM_middle
-        pha_prev = pha_x3
 
         # ---------------------------
-        # Middle交替：FM/TM 处理后立即耦合融合（取代交叉注意力）
+        # Middle交替：仅塔内处理，不做跨域融合（消融）
         stage_pairs = []
         for idx in range(self.num_mid_stages):
             pair_idx = idx // 2
@@ -374,22 +335,10 @@ class MambaSEUNet(nn.Module):
                 stage_pairs.append((mag_fm_blocks[pair_idx], pha_tm_blocks[pair_idx]))
             else:
                 stage_pairs.append((mag_tm_blocks[pair_idx], pha_fm_blocks[pair_idx]))
-        for idx, (mag_block, pha_block) in enumerate(stage_pairs):
+        for mag_block, pha_block in stage_pairs:
             mag_res, pha_res = mag_x3, pha_x3
-            mag_feat = mag_block(mag_x3)
-            pha_feat = pha_block(pha_x3)
-
-            mag_in_fuse = self.mid_in_proj_mag[idx](mag_feat)
-            pha_in_fuse = self.mid_in_proj_pha[idx](pha_feat)
-            mag_fused, pha_fused = self.mid_fusions[idx](mag_in_fuse, pha_in_fuse)
-
-            mag_cat = torch.cat([mag_feat, mag_fused], dim=1)
-            pha_cat = torch.cat([pha_feat, pha_fused], dim=1)
-            mag_x3 = self.mid_fusion_proj_mag[idx](mag_cat)
-            pha_x3 = self.mid_fusion_proj_pha[idx](pha_cat)
-            # 保持残差链路
-            mag_x3 = mag_x3 + mag_res
-            pha_x3 = pha_x3 + pha_res
+            mag_x3 = mag_block(mag_x3) + mag_res
+            pha_x3 = pha_block(pha_x3) + pha_res
 
         # ---------------------------
         # Decoder Level2 (after upsample+concat -> mamba -> residual)
@@ -449,9 +398,9 @@ class MambaSEUNet(nn.Module):
             pha_y1 = block(pha_y1)
         pha_final = self.pha_output(pha_y1 + pha_copy_ref) + pha_skip1
 
-        # Final耦合融合（相位先升维到 Mag 再交互，输出后压回相位宽度）
-        mag_fused, pha_fused_high = self.global_fusion(mag_final, self.global_in_proj_pha(pha_final))
-        pha_fused = self.global_out_proj_pha(torch.cat([pha_final, pha_fused_high], dim=1))
+        # 最终不做跨域融合（消融）
+        mag_fused = mag_final
+        pha_fused = pha_final
 
         if not torch.isfinite(pha_fused).all():
              raise RuntimeError('pha_fused contains NaN/Inf')
