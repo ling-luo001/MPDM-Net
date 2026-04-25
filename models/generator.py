@@ -151,7 +151,7 @@ class MambaSEUNet(nn.Module):
 
     架构逻辑：
     1. Magnitude Tower (Mag): 采用 FMamba，固定时间轴观察频率轴，学习谱包络（谐波、共振峰）。
-    2. Phase Tower (Pha): 采用 TMamba，固定频率轴观察时间轴，学习相位的时域演变（连续性）。
+    2. Phase Tower (Pha): 采用 TFMamba，联合时频建模相位演变（连续性）。
     """
 
     def __init__(self, cfg):
@@ -167,11 +167,11 @@ class MambaSEUNet(nn.Module):
         self.cross_global_window = cfg['model_cfg'].get('cross_global_window', 8)
         self.cross_sparsity = cfg['model_cfg'].get('cross_sparsity', 0.9)
 
-        # 维度设置: Mag 保持原始，Pha 减半
+        # 维度设置: Mag 与 Pha 保持一致（不再减半，用于可比性）
         mag_base = cfg['model_cfg']['hid_feature']
-        pha_base = max(1, mag_base // 2)
+        pha_base = mag_base
         self.mag_dim = [mag_base, mag_base * 2, mag_base * 3]
-        self.pha_dim = [pha_base, pha_base * 2, pha_base * 3]  # 约等于 [H/2, H, 1.5H]
+        self.pha_dim = [mag_base, mag_base * 2, mag_base * 3]
         mag_dim, pha_dim = self.mag_dim, self.pha_dim
         self.cross_pool_t = cfg['model_cfg'].get('cross_pool_t', 1)
         self.cross_pool_f = cfg['model_cfg'].get('cross_pool_f', 1)
@@ -188,7 +188,7 @@ class MambaSEUNet(nn.Module):
 
         pha_cfg = deepcopy(cfg)
         pha_cfg['model_cfg']['input_channel'] = 2
-        pha_cfg['model_cfg']['hid_feature'] = pha_base
+        pha_cfg['model_cfg']['hid_feature'] = mag_base
 
         # --- 2. Magnitude Tower 模块定义 (频域建模) ---
         self.mag_encoder = DenseEncoder(mag_cfg)
@@ -226,11 +226,11 @@ class MambaSEUNet(nn.Module):
         self.pha_encoder = DenseEncoder(pha_cfg)
         # Encoder 路径
         self.pha_patch_embed_encoder_level1 = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_TSMamba1_encoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
+        self.pha_TSMamba1_encoder = nn.ModuleList([TFMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
         self.pha_down1_2 = Downsample(pha_dim[0], pha_dim[1])
 
         self.pha_patch_embed_encoder_level2 = Patch_Embed_stage(pha_dim[1], pha_dim[1])
-        self.pha_TSMamba2_encoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
+        self.pha_TSMamba2_encoder = nn.ModuleList([TFMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
         self.pha_down2_3 = Downsample(pha_dim[1], pha_dim[2])
 
         # Bottleneck 中间层
@@ -242,16 +242,16 @@ class MambaSEUNet(nn.Module):
         self.pha_up3_2 = Upsample(pha_dim[2], pha_dim[1])
         self.pha_concat_level2 = nn.Sequential(nn.Conv2d(pha_dim[1] * 2, pha_dim[1], 1, 1, 0, bias=False))
         self.pha_patch_embed_decoder_level2 = Patch_Embed_stage(pha_dim[1], pha_dim[1])
-        self.pha_TSMamba2_decoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
+        self.pha_TSMamba2_decoder = nn.ModuleList([TFMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
 
         self.pha_up2_1 = Upsample(pha_dim[1], pha_dim[0])
         self.pha_concat_level1 = nn.Sequential(nn.Conv2d(pha_dim[0] * 2, pha_dim[0], 1, 1, 0, bias=False))
         self.pha_patch_embed_decoder_level1 = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_TSMamba1_decoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
+        self.pha_TSMamba1_decoder = nn.ModuleList([TFMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
 
         # Refinement 细化层
         self.pha_patch_embed_refinement = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_refinement = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
+        self.pha_refinement = nn.ModuleList([TFMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
         self.pha_output = nn.Sequential(nn.Conv2d(pha_dim[0], pha_dim[0], 3, 1, 1, bias=False))
 
         # --- 5. 双流 VSS 融合模块 ---
