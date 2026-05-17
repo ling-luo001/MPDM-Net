@@ -206,6 +206,132 @@ class ComplexDepthwiseConv1dNoBias(nn.Module):
         return y_r, y_i
 
 
+class ComplexConv2dNoBias(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+    ):
+        super().__init__()
+        self.conv_re = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False,
+        )
+        self.conv_im = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False,
+        )
+
+    def forward(self, x_r, x_i):
+        y_r = self.conv_re(x_r) - self.conv_im(x_i)
+        y_i = self.conv_re(x_i) + self.conv_im(x_r)
+        return y_r, y_i
+
+
+class ComplexRMSNorm2D(nn.Module):
+    def __init__(self, channels, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1, channels, 1, 1))
+        self.eps = eps
+
+    def forward(self, x_r, x_i):
+        rms = torch.sqrt(torch.mean(x_r ** 2 + x_i ** 2, dim=1, keepdim=True) + self.eps)
+        y_r = x_r / rms * self.weight
+        y_i = x_i / rms * self.weight
+        return y_r, y_i
+
+
+class ComplexPointwiseGate2D(nn.Module):
+    def __init__(self, cond_channels, out_channels, scale=1.0):
+        super().__init__()
+        self.scale = scale
+        self.net = nn.Sequential(
+            nn.Conv2d(cond_channels, out_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=1, num_channels=out_channels),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=True),
+        )
+
+    def forward(self, cond):
+        logits = self.net(cond)
+        return 1.0 + self.scale * torch.tanh(logits)
+
+
+class ComplexDownsample2D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        if out_channels % 4 != 0:
+            raise ValueError("ComplexDownsample2D requires out_channels divisible by 4.")
+        self.pre = ComplexConv2dNoBias(
+            in_channels,
+            in_channels,
+            kernel_size=3,
+            padding=1,
+            groups=in_channels,
+        )
+        self.reduce = ComplexConv2dNoBias(in_channels, out_channels // 4, kernel_size=1)
+        self.unshuffle = nn.PixelUnshuffle(2)
+
+    def forward(self, x_r, x_i):
+        y_r, y_i = self.pre(x_r, x_i)
+        y_r, y_i = self.reduce(y_r, y_i)
+        y_r = self.unshuffle(y_r)
+        y_i = self.unshuffle(y_i)
+        return y_r, y_i
+
+
+class ComplexUpsample2D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.pre = ComplexConv2dNoBias(
+            in_channels,
+            in_channels,
+            kernel_size=3,
+            padding=1,
+            groups=in_channels,
+        )
+        self.expand = ComplexConv2dNoBias(in_channels, out_channels * 4, kernel_size=1)
+        self.shuffle = nn.PixelShuffle(2)
+
+    def forward(self, x_r, x_i):
+        y_r, y_i = self.pre(x_r, x_i)
+        y_r, y_i = self.expand(y_r, y_i)
+        y_r = self.shuffle(y_r)
+        y_i = self.shuffle(y_i)
+        return y_r, y_i
+
+
+class ComplexConcatFuse2D(nn.Module):
+    def __init__(self, in_channels, out_channels, eps=1e-5):
+        super().__init__()
+        self.conv = ComplexConv2dNoBias(in_channels, out_channels, kernel_size=1)
+        self.norm = ComplexRMSNorm2D(out_channels, eps=eps)
+
+    def forward(self, x_r, x_i, skip_r, skip_i):
+        cat_r = torch.cat([x_r, skip_r], dim=1)
+        cat_i = torch.cat([x_i, skip_i], dim=1)
+        y_r, y_i = self.conv(cat_r, cat_i)
+        y_r, y_i = self.norm(y_r, y_i)
+        return y_r, y_i
+
+
 class EqMamba1D(nn.Module):
     def __init__(self, channels, cfg):
         super().__init__()

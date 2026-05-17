@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from .mamba_block import ComplexConv2dNoBias
 
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 import selective_scan_cuda
@@ -1319,4 +1320,55 @@ class GREVSSMidFusion(nn.Module):
         delta_i = pha_feat_i - pha_res_i
         pha_out_r = pha_res_r + mod * delta_r
         pha_out_i = pha_res_i + mod * delta_i
+        return mag_fused, pha_out_r, pha_out_i
+
+
+class GREVSSFinalFusion(nn.Module):
+    # GRE-safe VSS final fusion.
+    # VSSBlock_Cross_new uses only real-valued magnitude and |P| context.
+    # Complex phase updates are driven by real-valued modulation.
+    def __init__(
+        self,
+        hidden_dim: int,
+        phase_channels: int,
+        cfg,
+        drop_path: float = 0,
+        attn_drop_rate: float = 0,
+        d_state: int = 16,
+    ):
+        super().__init__()
+        self.vss_context = VSSBlock_Cross_new(
+            hidden_dim=hidden_dim,
+            drop_path=drop_path,
+            attn_drop_rate=attn_drop_rate,
+            d_state=d_state,
+        )
+        self.pha_abs_proj = nn.Sequential(
+            nn.Conv2d(phase_channels, hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=1, num_channels=hidden_dim),
+        )
+        gate_in_channels = hidden_dim * 3
+        self.phase_mod_gate = nn.Sequential(
+            nn.Conv2d(gate_in_channels, phase_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=1, num_channels=phase_channels),
+            nn.SiLU(),
+            nn.Conv2d(phase_channels, phase_channels, kernel_size=1, bias=True),
+        )
+        nn.init.zeros_(self.phase_mod_gate[-1].weight)
+        nn.init.zeros_(self.phase_mod_gate[-1].bias)
+        self.phase_delta = ComplexConv2dNoBias(phase_channels, phase_channels, kernel_size=3, padding=1)
+        self.gre_fusion_scale = nn.Parameter(torch.tensor(cfg['model_cfg'].get('gre_fusion_scale', 1.0)))
+
+    def forward(self, mag_final, pha_r, pha_i):
+        pha_abs = torch.sqrt(pha_r ** 2 + pha_i ** 2 + 1e-8)
+        pha_abs_high = self.pha_abs_proj(pha_abs)
+        mag_fused, pha_ctx = self.vss_context(mag_final, pha_abs_high)
+
+        gate_in = torch.cat([mag_final, mag_fused, pha_ctx], dim=1)
+        gate_logits = self.phase_mod_gate(gate_in)
+        mod = 1.0 + self.gre_fusion_scale * torch.tanh(gate_logits)
+
+        delta_r, delta_i = self.phase_delta(pha_r, pha_i)
+        pha_out_r = pha_r + mod * delta_r
+        pha_out_i = pha_i + mod * delta_i
         return mag_fused, pha_out_r, pha_out_i
