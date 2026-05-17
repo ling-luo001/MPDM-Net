@@ -6,7 +6,7 @@ import math
 from torchvision.ops.deform_conv import DeformConv2d
 from einops import rearrange
 from copy import deepcopy
-from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
+from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM, EqTMambaBlock, EqFMambaBlock
 from .cross import VSSBlock_Cross_new
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
 import torch.nn.functional as F
@@ -166,6 +166,8 @@ class MambaSEUNet(nn.Module):
         self.cross_sparse_window = cfg['model_cfg'].get('cross_sparse_window', 64)
         self.cross_global_window = cfg['model_cfg'].get('cross_global_window', 8)
         self.cross_sparsity = cfg['model_cfg'].get('cross_sparsity', 0.9)
+        self.use_eq_phase_mamba = cfg['model_cfg'].get('use_eq_phase_mamba', False)
+        self.eq_phase_mamba_scope = cfg['model_cfg'].get('eq_phase_mamba_scope', 'middle')
 
         # 维度设置: Mag 保持原始，Pha 减半
         mag_base = cfg['model_cfg']['hid_feature']
@@ -235,8 +237,12 @@ class MambaSEUNet(nn.Module):
 
         # Bottleneck 中间层
         self.pha_patch_embed_middle = Patch_Embed_stage(pha_dim[2], pha_dim[2])
-        self.pha_TM_middle = nn.ModuleList([TMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
-        self.pha_FM_middle = nn.ModuleList([FMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
+        if self.use_eq_phase_mamba and self.eq_phase_mamba_scope in ['middle', 'all']:
+            self.pha_TM_middle = nn.ModuleList([EqTMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
+            self.pha_FM_middle = nn.ModuleList([EqFMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
+        else:
+            self.pha_TM_middle = nn.ModuleList([TMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
+            self.pha_FM_middle = nn.ModuleList([FMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
 
         # Decoder 路径
         self.pha_up3_2 = Upsample(pha_dim[2], pha_dim[1])
