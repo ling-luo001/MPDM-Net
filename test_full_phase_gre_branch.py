@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from models.generator import ComplexPatchEmbed2D, ComplexPhaseHead, MambaSEUNet
+from models.generator import ComplexPatchEmbed2D, ComplexPhaseDecoderHead, MambaSEUNet
 from models.mamba_block import (
     ComplexConcatFuse2D,
     ComplexConv2dNoBias,
@@ -40,18 +40,15 @@ def _get_cfg():
             "cross_sparse_window": 64,
             "cross_global_window": 8,
             "cross_sparsity": 0.9,
-            "use_eq_phase_mamba": True,
-            "eq_phase_mamba_scope": "middle",
-            "use_complex_phase_bottleneck": True,
-            "use_gre_mid_fusion": True,
-            "use_full_phase_gre": True,
-            "use_pha_pre_decoder_ffn": False,
             "eq_mamba_res_scale": 1.0,
             "eq_mamba_dropout": 0.0,
             "eq_mamba_bidirectional": True,
             "eq_mamba_use_complex_conv": True,
+            "full_phase_stem_freq_stride": 2,
+            "full_phase_stem_use_post_conv": False,
+            "phase_head_upsample_mode": "bilinear",
             "gre_fusion_scale": 1.0,
-            "pha_mid_to_real_residual": True,
+            "use_complex_phase_refine_ffn": True,
             "pha_ffn_dropout": 0.0,
             "pha_ffn_res_scale": 1.0,
             "pha_ffn_expansion": 4,
@@ -79,7 +76,7 @@ def test_complex_2d_modules_shape_backward():
     down = ComplexDownsample2D(c, c * 2).to(device)
     up = ComplexUpsample2D(c * 2, c).to(device)
     fuse = ComplexConcatFuse2D(c * 2, c).to(device)
-    head = ComplexPhaseHead(c).to(device)
+    head = ComplexPhaseDecoderHead(c).to(device)
 
     y_r, y_i = conv(x_r, x_i)
     y_r, y_i = norm(y_r, y_i)
@@ -87,7 +84,7 @@ def test_complex_2d_modules_shape_backward():
     d_r, d_i = down(p_r, p_i)
     u_r, u_i = up(d_r, d_i)
     f_r, f_i = fuse(u_r, u_i, y_r, y_i)
-    pred_cos, pred_sin = head(f_r, f_i)
+    pred_cos, pred_sin = head(f_r, f_i, target_size=(t, f))
 
     assert y_r.shape == x_r.shape
     assert y_i.shape == x_i.shape
@@ -114,7 +111,7 @@ def test_complex_phase_head_equivariance():
     x_r = torch.randn(b, c, t, f, device=device)
     x_i = torch.randn(b, c, t, f, device=device)
 
-    head = ComplexPhaseHead(c).to(device)
+    head = ComplexPhaseDecoderHead(c).to(device)
     head.eval()
 
     theta = torch.rand(1, device=device) * 2 * math.pi
@@ -124,8 +121,9 @@ def test_complex_phase_head_equivariance():
     x2_r = cos_t * x_r - sin_t * x_i
     x2_i = sin_t * x_r + cos_t * x_i
 
-    y1_c, y1_s = head(x_r, x_i)
-    y2_c, y2_s = head(x2_r, x2_i)
+    target_size = (t, f)
+    y1_c, y1_s = head(x_r, x_i, target_size=target_size)
+    y2_c, y2_s = head(x2_r, x2_i, target_size=target_size)
 
     target_c = cos_t * y1_c - sin_t * y1_s
     target_s = sin_t * y1_c + cos_t * y1_s
@@ -139,7 +137,7 @@ def test_complex_phase_head_equivariance():
         + 1e-8
     )
 
-    print(f"ComplexPhaseHead equivariance error: {err.item()}")
+    print(f"ComplexPhaseDecoderHead equivariance error: {err.item()}")
     assert err < 1e-3
 
 
@@ -148,7 +146,6 @@ def test_full_phase_branch_construction():
     cfg = _get_cfg()
     model = MambaSEUNet(cfg).to(device)
 
-    assert model.use_full_phase_gre is True
     assert hasattr(model, "pha_complex_stem")
     assert hasattr(model, "gre_final_fusion")
     assert hasattr(model, "complex_phase_head")
@@ -179,4 +176,65 @@ def test_full_model_forward_smoke():
     assert torch.isfinite(denoised_mag).all()
     assert torch.isfinite(pred_pha).all()
     assert torch.isfinite(denoised_com).all()
+
+
+def test_phase_head_upsample_norm():
+    device = _get_device()
+    b, c, t, f = 2, 8, 20, 64
+    x_r = torch.randn(b, c, t, f // 2, device=device)
+    x_i = torch.randn(b, c, t, f // 2, device=device)
+
+    head = ComplexPhaseDecoderHead(c, upsample_mode="bilinear").to(device)
+    pred_cos, pred_sin = head(x_r, x_i, target_size=(t, f))
+
+    assert pred_cos.shape == (b, t, f)
+    assert pred_sin.shape == (b, t, f)
+    assert torch.isfinite(pred_cos).all()
+    assert torch.isfinite(pred_sin).all()
+
+    norm = torch.sqrt(pred_cos ** 2 + pred_sin ** 2 + 1e-8)
+    err = (norm - 1.0).abs().mean()
+    assert err < 1e-3
+
+
+def test_full_phase_mid_fusion_alignment():
+    device = _get_device()
+    cfg = _get_cfg()
+    model = MambaSEUNet(cfg).to(device)
+    model.eval()
+
+    b = 1
+    f = cfg["stft_cfg"]["n_fft"] // 2 + 1
+    t = 64
+
+    noisy_mag = torch.rand(b, f, t, device=device)
+    noisy_pha = torch.randn(b, f, t, device=device)
+
+    mag_shapes = []
+    pha_shapes = []
+
+    def _mag_hook(_module, _inp, out):
+        mag_shapes.append(out.shape)
+
+    def _pha_hook(_module, _inp, out):
+        pha_shapes.append(out.shape)
+
+    hooks = []
+    for mod in model.mid_in_proj_mag:
+        hooks.append(mod.register_forward_hook(_mag_hook))
+    for mod in model.mid_in_proj_pha:
+        hooks.append(mod.register_forward_hook(_pha_hook))
+
+    with torch.no_grad():
+        model(noisy_mag, noisy_pha)
+
+    for h in hooks:
+        h.remove()
+
+    assert mag_shapes, "mag_in_fuse shapes not captured"
+    assert pha_shapes, "pha_in_fuse shapes not captured"
+    for mag_shape, pha_shape in zip(mag_shapes, pha_shapes):
+        assert mag_shape[-2:] == pha_shape[-2:], f"mid fusion mismatch: {mag_shape} vs {pha_shape}"
+        print(f"mid fusion spatial: mag_in_fuse={mag_shape}, pha_in_fuse={pha_shape}")
+
 

@@ -450,7 +450,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
     # parser.add_argument('--exp_name', default='Mambavision_emb_08')
-    parser.add_argument('--exp_name', default='MPDM_Net_main_min_Eq_v4')
+    parser.add_argument('--exp_name', default='MPDM_Net_main_min_Eq_v3')
     parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
     args = parser.parse_args()
 

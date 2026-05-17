@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from models.generator import ComplexPhaFFN1D, PhaFFNAdapter2D, MambaSEUNet
+from models.generator import ComplexPhaFFN1D, PhaFFNAdapter2D
 
 
 def _get_device():
@@ -12,50 +12,6 @@ def _get_device():
     return torch.device("cuda")
 
 
-def _get_cfg():
-    return {
-        "model_cfg": {
-            "hid_feature": 16,
-            "dense_channel": 16,
-            "compress_factor": 0.3,
-            "num_tfmamba": 2,
-            "num_mid_pairs": 2,
-            "d_state": 16,
-            "d_conv": 4,
-            "expand": 4,
-            "norm_epsilon": 1e-5,
-            "beta": 2.0,
-            "input_channel": 2,
-            "output_channel": 1,
-            "cross_pool_t": 1,
-            "cross_pool_f": 1,
-            "cross_sparse_window": 64,
-            "cross_global_window": 8,
-            "cross_sparsity": 0.9,
-            "use_eq_phase_mamba": True,
-            "eq_phase_mamba_scope": "middle",
-            "use_complex_phase_bottleneck": True,
-            "use_gre_mid_fusion": True,
-            "use_pha_pre_decoder_ffn": True,
-            "eq_mamba_res_scale": 1.0,
-            "eq_mamba_dropout": 0.0,
-            "eq_mamba_bidirectional": True,
-            "eq_mamba_use_complex_conv": True,
-            "gre_fusion_scale": 1.0,
-            "pha_mid_to_real_residual": True,
-            "pha_ffn_dropout": 0.0,
-            "pha_ffn_res_scale": 1.0,
-            "pha_ffn_expansion": 4,
-            "pha_ffn_use_complex_conv": True,
-            "pha_ffn_kernel_size": 3,
-        },
-        "training_cfg": {
-            "segment_size": 32000,
-        },
-        "stft_cfg": {
-            "n_fft": 510,
-        },
-    }
 
 
 def test_complex_pha_ffn1d_shape_backward():
@@ -149,13 +105,4 @@ def test_pha_ffn_adapter2d_shape_backward():
     loss.backward()
 
 
-def test_full_model_construction():
-    device = _get_device()
-    cfg = _get_cfg()
-    model = MambaSEUNet(cfg).to(device)
-
-    assert isinstance(model.pha_pre_decoder_ffn, PhaFFNAdapter2D)
-    assert hasattr(model.pha_pre_decoder_ffn, "to_complex")
-    assert hasattr(model.pha_pre_decoder_ffn, "pha_ffn")
-    assert hasattr(model.pha_pre_decoder_ffn, "to_real")
 

@@ -10,13 +10,8 @@ from .mamba_block import (
     TMambaBlock,
     FMambaBlock,
     TFMambaBlock,
-    CBAM,
-    EqTMambaBlock,
-    EqFMambaBlock,
     ComplexEqTMambaBlock,
     ComplexEqFMambaBlock,
-    PhaseMidToComplex2D,
-    PhaseMidToReal2D,
     ComplexRMSNorm1D,
     ComplexLinearNoBias,
     ComplexDepthwiseConv1dNoBias,
@@ -27,8 +22,8 @@ from .mamba_block import (
     ComplexUpsample2D,
     ComplexConcatFuse2D,
 )
-from .cross import VSSBlock_Cross_new, GREVSSMidFusion, GREVSSFinalFusion
-from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
+from .cross import GREVSSMidFusion, GREVSSFinalFusion
+from .codec_module import DenseEncoder, MagDecoder
 import torch.nn.functional as F
 
 
@@ -253,10 +248,30 @@ class PhaFFNAdapter2D(nn.Module):
 
 
 class ComplexPhaseStem(nn.Module):
-    def __init__(self, phase_channels, eps=1e-5, gate_cond_channels=None, gate_scale=1.0):
+    def __init__(
+        self,
+        phase_channels,
+        eps=1e-5,
+        gate_cond_channels=None,
+        gate_scale=1.0,
+        freq_stride=2,
+        use_post_conv=False,
+    ):
         super().__init__()
-        self.conv = ComplexConv2dNoBias(1, phase_channels, kernel_size=3, padding=1)
+        self.conv = ComplexConv2dNoBias(
+            1,
+            phase_channels,
+            kernel_size=(1, 3),
+            stride=(1, freq_stride),
+            padding=(0, 1),
+        )
         self.norm = ComplexRMSNorm2D(phase_channels, eps=eps)
+        self.post = None
+        if use_post_conv:
+            self.post = nn.Sequential(
+                ComplexConv2dNoBias(phase_channels, phase_channels, kernel_size=3, padding=1),
+                ComplexRMSNorm2D(phase_channels, eps=eps),
+            )
         self.gate = None
         if gate_cond_channels is not None:
             self.gate = ComplexPointwiseGate2D(gate_cond_channels, phase_channels, scale=gate_scale)
@@ -266,6 +281,8 @@ class ComplexPhaseStem(nn.Module):
         x_i = torch.sin(noisy_pha_4d)
         y_r, y_i = self.conv(x_r, x_i)
         y_r, y_i = self.norm(y_r, y_i)
+        if self.post is not None:
+            y_r, y_i = self.post(y_r, y_i)
         if self.gate is not None and cond is not None:
             mod = self.gate(cond)
             y_r = y_r * mod
@@ -335,19 +352,36 @@ class ComplexPhaseRefineBlock(nn.Module):
         return y_r, y_i
 
 
-class ComplexPhaseHead(nn.Module):
-    def __init__(self, channels, eps=1e-8):
+class ComplexPhaseDecoderHead(nn.Module):
+    def __init__(self, channels, eps=1e-8, upsample_mode="bilinear"):
         super().__init__()
         self.eps = eps
+        self.upsample_mode = upsample_mode
         self.head = ComplexConv2dNoBias(channels, 1, kernel_size=1)
 
-    def forward(self, x_r, x_i):
+    def forward(self, x_r, x_i, target_size):
         out_r, out_i = self.head(x_r, x_i)
-        norm = torch.sqrt(out_r ** 2 + out_i ** 2 + self.eps)
-        pred_cos = out_r / norm
-        pred_sin = out_i / norm
-        pred_cos = pred_cos.squeeze(1)
-        pred_sin = pred_sin.squeeze(1)
+        pred_cos = out_r.squeeze(1)
+        pred_sin = out_i.squeeze(1)
+
+        if pred_cos.shape[-2:] != target_size:
+            align = False if self.upsample_mode in ["bilinear", "bicubic"] else None
+            pred_cos = F.interpolate(
+                pred_cos.unsqueeze(1),
+                size=target_size,
+                mode=self.upsample_mode,
+                align_corners=align,
+            ).squeeze(1)
+            pred_sin = F.interpolate(
+                pred_sin.unsqueeze(1),
+                size=target_size,
+                mode=self.upsample_mode,
+                align_corners=align,
+            ).squeeze(1)
+
+        norm = torch.sqrt(pred_cos ** 2 + pred_sin ** 2 + self.eps)
+        pred_cos = pred_cos / norm
+        pred_sin = pred_sin / norm
         return pred_cos, pred_sin
 
 
@@ -372,18 +406,6 @@ class MambaSEUNet(nn.Module):
         self.cross_sparse_window = cfg['model_cfg'].get('cross_sparse_window', 64)
         self.cross_global_window = cfg['model_cfg'].get('cross_global_window', 8)
         self.cross_sparsity = cfg['model_cfg'].get('cross_sparsity', 0.9)
-        self.use_eq_phase_mamba = cfg['model_cfg'].get('use_eq_phase_mamba', False)
-        self.eq_phase_mamba_scope = cfg['model_cfg'].get('eq_phase_mamba_scope', 'middle')
-        self.use_complex_phase_bottleneck = cfg['model_cfg'].get('use_complex_phase_bottleneck', False)
-        self.use_gre_mid_fusion = cfg['model_cfg'].get('use_gre_mid_fusion', False)
-        self.use_pha_pre_decoder_ffn = cfg['model_cfg'].get('use_pha_pre_decoder_ffn', False)
-        self.use_full_phase_gre = cfg['model_cfg'].get('use_full_phase_gre', False)
-        if self.use_full_phase_gre and not self.use_complex_phase_bottleneck:
-            raise ValueError("use_full_phase_gre=True requires use_complex_phase_bottleneck=True")
-        if self.use_full_phase_gre and not self.use_gre_mid_fusion:
-            raise ValueError("use_full_phase_gre=True requires use_gre_mid_fusion=True")
-        self.pha_mid_to_real_residual = cfg['model_cfg'].get('pha_mid_to_real_residual', True)
-        self.enable_complex_phase_bottleneck = self.use_complex_phase_bottleneck and self.use_gre_mid_fusion
 
         # 维度设置: Mag 保持原始，Pha 减半
         mag_base = cfg['model_cfg']['hid_feature']
@@ -404,9 +426,6 @@ class MambaSEUNet(nn.Module):
         mag_cfg['model_cfg']['input_channel'] = 2
         mag_cfg['model_cfg']['hid_feature'] = mag_base
 
-        pha_cfg = deepcopy(cfg)
-        pha_cfg['model_cfg']['input_channel'] = 2
-        pha_cfg['model_cfg']['hid_feature'] = pha_base
 
         # --- 2. Magnitude Tower 模块定义 (频域建模) ---
         self.mag_encoder = DenseEncoder(mag_cfg)
@@ -440,102 +459,72 @@ class MambaSEUNet(nn.Module):
         self.mag_refinement = nn.ModuleList([TFMambaBlock(cfg, mag_dim[0]) for _ in range(self.num_tscblocks)])
         self.mag_output = nn.Sequential(nn.Conv2d(mag_dim[0], mag_dim[0], 3, 1, 1, bias=False))
 
-        # --- 3. Phase Tower 模块定义 (时域建模) ---
-        self.pha_encoder = DenseEncoder(pha_cfg)
-        # Encoder 路径
-        self.pha_patch_embed_encoder_level1 = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_TSMamba1_encoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
-        self.pha_down1_2 = Downsample(pha_dim[0], pha_dim[1])
+        # --- 3. Phase Tower 模块定义 (full complex GRE-safe) ---
+        self.pha_complex_stem = ComplexPhaseStem(
+            phase_channels=pha_dim[0],
+            freq_stride=cfg['model_cfg'].get('full_phase_stem_freq_stride', 2),
+            use_post_conv=cfg['model_cfg'].get('full_phase_stem_use_post_conv', False),
+            eps=cfg['model_cfg'].get('norm_epsilon', 1e-5),
+        )
+        self.pha_complex_patch_embed_encoder_level1 = ComplexPatchEmbed2D(pha_dim[0])
+        self.pha_complex_TSMamba1_encoder = nn.ModuleList([
+            ComplexEqTMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)
+        ])
+        self.pha_complex_down1_2 = ComplexDownsample2D(pha_dim[0], pha_dim[1])
 
-        self.pha_patch_embed_encoder_level2 = Patch_Embed_stage(pha_dim[1], pha_dim[1])
-        self.pha_TSMamba2_encoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
-        self.pha_down2_3 = Downsample(pha_dim[1], pha_dim[2])
+        self.pha_complex_patch_embed_encoder_level2 = ComplexPatchEmbed2D(pha_dim[1])
+        self.pha_complex_TSMamba2_encoder = nn.ModuleList([
+            ComplexEqTMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)
+        ])
+        self.pha_complex_down2_3 = ComplexDownsample2D(pha_dim[1], pha_dim[2])
+        self.pha_complex_patch_embed_middle = ComplexPatchEmbed2D(pha_dim[2])
 
-        # Bottleneck 中间层
-        self.pha_patch_embed_middle = Patch_Embed_stage(pha_dim[2], pha_dim[2])
-        if self.enable_complex_phase_bottleneck:
-            self.pha_TM_middle = nn.ModuleList([
-                ComplexEqTMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)
-            ])
-            self.pha_FM_middle = nn.ModuleList([
-                ComplexEqFMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)
-            ])
-            self.pha_mid_to_complex = PhaseMidToComplex2D(pha_dim[2])
-            self.pha_mid_to_real = PhaseMidToReal2D(pha_dim[2])
-        elif self.use_eq_phase_mamba and self.eq_phase_mamba_scope in ['middle', 'all']:
-            self.pha_TM_middle = nn.ModuleList([EqTMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
-            self.pha_FM_middle = nn.ModuleList([EqFMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
-        else:
-            self.pha_TM_middle = nn.ModuleList([TMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
-            self.pha_FM_middle = nn.ModuleList([FMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
+        self.pha_TM_middle = nn.ModuleList([
+            ComplexEqTMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)
+        ])
+        self.pha_FM_middle = nn.ModuleList([
+            ComplexEqFMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)
+        ])
 
-        # Decoder 路径
-        self.pha_up3_2 = Upsample(pha_dim[2], pha_dim[1])
-        self.pha_concat_level2 = nn.Sequential(nn.Conv2d(pha_dim[1] * 2, pha_dim[1], 1, 1, 0, bias=False))
-        self.pha_patch_embed_decoder_level2 = Patch_Embed_stage(pha_dim[1], pha_dim[1])
-        self.pha_TSMamba2_decoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
+        self.pha_complex_up3_2 = ComplexUpsample2D(pha_dim[2], pha_dim[1])
+        self.pha_complex_concat_level2 = ComplexConcatFuse2D(pha_dim[1] * 2, pha_dim[1])
+        self.pha_complex_patch_embed_decoder_level2 = ComplexPatchEmbed2D(pha_dim[1])
+        self.pha_complex_TSMamba2_decoder = nn.ModuleList([
+            ComplexEqTMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)
+        ])
 
-        self.pha_up2_1 = Upsample(pha_dim[1], pha_dim[0])
-        self.pha_concat_level1 = nn.Sequential(nn.Conv2d(pha_dim[0] * 2, pha_dim[0], 1, 1, 0, bias=False))
-        self.pha_patch_embed_decoder_level1 = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_TSMamba1_decoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
+        self.pha_complex_up2_1 = ComplexUpsample2D(pha_dim[1], pha_dim[0])
+        self.pha_complex_concat_level1 = ComplexConcatFuse2D(pha_dim[0] * 2, pha_dim[0])
+        self.pha_complex_patch_embed_decoder_level1 = ComplexPatchEmbed2D(pha_dim[0])
+        self.pha_complex_TSMamba1_decoder = nn.ModuleList([
+            ComplexEqTMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)
+        ])
 
-        # Refinement 细化层
-        self.pha_patch_embed_refinement = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_refinement = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
-        self.pha_output = nn.Sequential(nn.Conv2d(pha_dim[0], pha_dim[0], 3, 1, 1, bias=False))
-
-        if self.use_full_phase_gre:
-            self.pha_complex_stem = ComplexPhaseStem(phase_channels=pha_dim[0])
-            self.pha_complex_patch_embed_encoder_level1 = ComplexPatchEmbed2D(pha_dim[0])
-            self.pha_complex_TSMamba1_encoder = nn.ModuleList([
-                ComplexEqTMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)
-            ])
-            self.pha_complex_down1_2 = ComplexDownsample2D(pha_dim[0], pha_dim[1])
-
-            self.pha_complex_patch_embed_encoder_level2 = ComplexPatchEmbed2D(pha_dim[1])
-            self.pha_complex_TSMamba2_encoder = nn.ModuleList([
-                ComplexEqTMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)
-            ])
-            self.pha_complex_down2_3 = ComplexDownsample2D(pha_dim[1], pha_dim[2])
-
-            self.pha_complex_patch_embed_middle = ComplexPatchEmbed2D(pha_dim[2])
-
-            self.pha_complex_up3_2 = ComplexUpsample2D(pha_dim[2], pha_dim[1])
-            self.pha_complex_concat_level2 = ComplexConcatFuse2D(pha_dim[1] * 2, pha_dim[1])
-            self.pha_complex_patch_embed_decoder_level2 = ComplexPatchEmbed2D(pha_dim[1])
-            self.pha_complex_TSMamba2_decoder = nn.ModuleList([
-                ComplexEqTMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)
-            ])
-
-            self.pha_complex_up2_1 = ComplexUpsample2D(pha_dim[1], pha_dim[0])
-            self.pha_complex_concat_level1 = ComplexConcatFuse2D(pha_dim[0] * 2, pha_dim[0])
-            self.pha_complex_patch_embed_decoder_level1 = ComplexPatchEmbed2D(pha_dim[0])
-            self.pha_complex_TSMamba1_decoder = nn.ModuleList([
-                ComplexEqTMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)
-            ])
-
-            self.pha_complex_patch_embed_refinement = ComplexPatchEmbed2D(pha_dim[0])
-            self.pha_complex_refinement = nn.ModuleList([
-                ComplexEqTMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)
-            ])
-            self.pha_complex_output = ComplexPhaseRefineBlock(
-                pha_dim[0],
-                eps=cfg['model_cfg'].get('norm_epsilon', 1e-5),
-                use_pha_ffn=self.use_pha_pre_decoder_ffn,
-                ffn_expansion=cfg['model_cfg'].get('pha_ffn_expansion', 4),
-                ffn_dropout=cfg['model_cfg'].get('pha_ffn_dropout', 0.0),
-                ffn_use_complex_conv=cfg['model_cfg'].get('pha_ffn_use_complex_conv', True),
-                ffn_kernel_size=cfg['model_cfg'].get('pha_ffn_kernel_size', 3),
-                ffn_res_scale=cfg['model_cfg'].get('pha_ffn_res_scale', 1.0),
-            )
-            self.gre_final_fusion = GREVSSFinalFusion(
-                hidden_dim=mag_dim[0],
-                phase_channels=pha_dim[0],
-                cfg=cfg,
-                d_state=cfg['model_cfg'].get('d_state', 16),
-            )
-            self.complex_phase_head = ComplexPhaseHead(pha_dim[0])
+        self.pha_complex_patch_embed_refinement = ComplexPatchEmbed2D(pha_dim[0])
+        self.pha_complex_refinement = nn.ModuleList([
+            ComplexEqTMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)
+        ])
+        self.pha_complex_output = ComplexPhaseRefineBlock(
+            pha_dim[0],
+            eps=cfg['model_cfg'].get('norm_epsilon', 1e-5),
+            use_pha_ffn=cfg['model_cfg'].get('use_complex_phase_refine_ffn', True),
+            ffn_expansion=cfg['model_cfg'].get('pha_ffn_expansion', 4),
+            ffn_dropout=cfg['model_cfg'].get('pha_ffn_dropout', 0.0),
+            ffn_use_complex_conv=cfg['model_cfg'].get('pha_ffn_use_complex_conv', True),
+            ffn_kernel_size=cfg['model_cfg'].get('pha_ffn_kernel_size', 3),
+            ffn_res_scale=cfg['model_cfg'].get('pha_ffn_res_scale', 1.0),
+        )
+        self.gre_final_fusion = GREVSSFinalFusion(
+            hidden_dim=mag_dim[0],
+            phase_channels=pha_dim[0],
+            cfg=cfg,
+            d_state=cfg['model_cfg'].get('d_state', 16),
+        )
+        self.complex_phase_head = ComplexPhaseDecoderHead(
+            pha_dim[0],
+            eps=1e-8,
+            upsample_mode=cfg['model_cfg'].get('phase_head_upsample_mode', 'bilinear'),
+        )
 
         # --- 5. 双流 VSS 融合模块 ---
         # 1) 独立投影到高维 3H
@@ -552,17 +541,14 @@ class MambaSEUNet(nn.Module):
             ) for _ in range(self.num_mid_stages)
         ])
         # 2) VSS 交互（同维 3H）
-        if self.enable_complex_phase_bottleneck:
-            self.mid_fusions = nn.ModuleList([
-                GREVSSMidFusion(
-                    hidden_dim=mag_dim[2],
-                    phase_channels=pha_dim[2],
-                    cfg=cfg,
-                    d_state=cfg['model_cfg'].get('d_state', 16),
-                ) for _ in range(self.num_mid_stages)
-            ])
-        else:
-            self.mid_fusions = nn.ModuleList([VSSBlock_Cross_new(hidden_dim=mag_dim[2]) for _ in range(self.num_mid_stages)])
+        self.mid_fusions = nn.ModuleList([
+            GREVSSMidFusion(
+                hidden_dim=mag_dim[2],
+                phase_channels=pha_dim[2],
+                cfg=cfg,
+                d_state=cfg['model_cfg'].get('d_state', 16),
+            ) for _ in range(self.num_mid_stages)
+        ])
         # 3) 融合后还原各自宽度
         self.mid_fusion_proj_mag = nn.ModuleList([
             nn.Sequential(
@@ -576,35 +562,9 @@ class MambaSEUNet(nn.Module):
                 nn.GroupNorm(num_groups=1, num_channels=pha_dim[2])
             ) for _ in range(self.num_mid_stages)
         ])
-        # 全局融合前将 Pha 提升到 Mag 宽度
-        self.global_in_proj_pha = nn.Sequential(
-            nn.Conv2d(pha_dim[0], mag_dim[0], 1, 1, 0, bias=False),
-            nn.GroupNorm(num_groups=1, num_channels=mag_dim[0])
-        )
-        self.global_fusion = VSSBlock_Cross_new(hidden_dim=mag_dim[0])
-        self.global_out_proj_pha = nn.Sequential(
-            nn.Conv2d(pha_dim[0] + mag_dim[0], pha_dim[0], 1, 1, 0, bias=False),
-            nn.GroupNorm(num_groups=1, num_channels=pha_dim[0])
-        )
-        if self.use_pha_pre_decoder_ffn:
-            self.pha_pre_decoder_ffn = PhaFFNAdapter2D(
-                channels=pha_dim[0],
-                dropout=cfg['model_cfg'].get('pha_ffn_dropout', 0.0),
-                res_scale=cfg['model_cfg'].get('pha_ffn_res_scale', 1.0),
-                expansion=cfg['model_cfg'].get('pha_ffn_expansion', 4),
-                norm_epsilon=cfg['model_cfg'].get('norm_epsilon', 1e-5),
-                use_complex_conv=cfg['model_cfg'].get('pha_ffn_use_complex_conv', True),
-                kernel_size=cfg['model_cfg'].get('pha_ffn_kernel_size', 3),
-            )
-        else:
-            self.pha_pre_decoder_ffn = nn.Identity()
-
         # --- 4. 最终解码器 ---
         self.mag_to_mask_proj = nn.Conv2d(mag_dim[0], mag_base, 1, 1, 0, bias=False)
         self.mask_decoder = MagDecoder(cfg)
-        pha_dec_cfg = deepcopy(cfg)
-        pha_dec_cfg['model_cfg']['hid_feature'] = pha_base
-        self.phase_decoder = PhaseDecoder(pha_dec_cfg)
 
     def forward(self, noisy_mag, noisy_pha):
         if not torch.isfinite(noisy_mag).all():
@@ -618,7 +578,6 @@ class MambaSEUNet(nn.Module):
 
         # 双塔均使用原始 cat 输入
         mag_in = torch.cat((noisy_mag_4d, noisy_pha_4d), dim=1)
-        pha_in = torch.cat((noisy_mag_4d, noisy_pha_4d), dim=1)
 
         # ---------------------------
         # Magnitude Tower Encoder
@@ -643,10 +602,9 @@ class MambaSEUNet(nn.Module):
         mag_x3 = self.mag_patch_embed_middle(mag_x3)
         mag_fm_blocks = self.mag_FM_middle
         mag_tm_blocks = self.mag_TM_middle
-        mag_prev = mag_x3
 
         # ---------------------------
-        # Phase Tower Encoder (conditional full complex phase branch)
+        # Phase Tower Encoder (full complex GRE-safe)
         # ---------------------------
         stage_pairs = []
         for idx in range(self.num_mid_stages):
@@ -656,129 +614,56 @@ class MambaSEUNet(nn.Module):
             else:
                 stage_pairs.append((mag_tm_blocks[pair_idx], self.pha_FM_middle[pair_idx]))
 
-        if self.use_full_phase_gre:
-            # The full complex phase branch is magnitude-conditioned.
-            # Since the magnitude branch may still depend on raw noisy phase,
-            # this is conditional phase equivariance rather than strict full-network GRE.
-            pha_r1, pha_i1 = self.pha_complex_stem(noisy_pha_4d)
-            pha_copy1_r, pha_copy1_i = pha_r1, pha_i1
-            pha_r1, pha_i1 = self.pha_complex_patch_embed_encoder_level1(pha_r1, pha_i1)
-            for block in self.pha_complex_TSMamba1_encoder:
-                pha_r1, pha_i1 = block(pha_r1, pha_i1)
-            pha_r1 = pha_copy1_r + pha_r1
-            pha_i1 = pha_copy1_i + pha_i1
-            pha_skip1_r, pha_skip1_i = pha_r1, pha_i1
+        pha_r1, pha_i1 = self.pha_complex_stem(noisy_pha_4d)
+        pha_copy1_r, pha_copy1_i = pha_r1, pha_i1
+        pha_r1, pha_i1 = self.pha_complex_patch_embed_encoder_level1(pha_r1, pha_i1)
+        for block in self.pha_complex_TSMamba1_encoder:
+            pha_r1, pha_i1 = block(pha_r1, pha_i1)
+        pha_r1 = pha_copy1_r + pha_r1
+        pha_i1 = pha_copy1_i + pha_i1
+        pha_skip1_r, pha_skip1_i = pha_r1, pha_i1
 
-            pha_r2, pha_i2 = self.pha_complex_down1_2(pha_r1, pha_i1)
-            pha_copy2_r, pha_copy2_i = pha_r2, pha_i2
-            pha_r2, pha_i2 = self.pha_complex_patch_embed_encoder_level2(pha_r2, pha_i2)
-            for block in self.pha_complex_TSMamba2_encoder:
-                pha_r2, pha_i2 = block(pha_r2, pha_i2)
-            pha_r2 = pha_copy2_r + pha_r2
-            pha_i2 = pha_copy2_i + pha_i2
-            pha_skip2_r, pha_skip2_i = pha_r2, pha_i2
+        pha_r2, pha_i2 = self.pha_complex_down1_2(pha_r1, pha_i1)
+        pha_copy2_r, pha_copy2_i = pha_r2, pha_i2
+        pha_r2, pha_i2 = self.pha_complex_patch_embed_encoder_level2(pha_r2, pha_i2)
+        for block in self.pha_complex_TSMamba2_encoder:
+            pha_r2, pha_i2 = block(pha_r2, pha_i2)
+        pha_r2 = pha_copy2_r + pha_r2
+        pha_i2 = pha_copy2_i + pha_i2
+        pha_skip2_r, pha_skip2_i = pha_r2, pha_i2
 
-            pha_r3, pha_i3 = self.pha_complex_down2_3(pha_r2, pha_i2)
-            pha_r3, pha_i3 = self.pha_complex_patch_embed_middle(pha_r3, pha_i3)
+        pha_r3, pha_i3 = self.pha_complex_down2_3(pha_r2, pha_i2)
+        pha_r3, pha_i3 = self.pha_complex_patch_embed_middle(pha_r3, pha_i3)
 
-            for idx, (mag_block, pha_block) in enumerate(stage_pairs):
-                mag_res = mag_x3
-                pha_res_r, pha_res_i = pha_r3, pha_i3
+        for idx, (mag_block, pha_block) in enumerate(stage_pairs):
+            mag_res = mag_x3
+            pha_res_r, pha_res_i = pha_r3, pha_i3
 
-                mag_feat = mag_block(mag_x3)
-                pha_feat_r, pha_feat_i = pha_block(pha_r3, pha_i3)
+            mag_feat = mag_block(mag_x3)
+            pha_feat_r, pha_feat_i = pha_block(pha_r3, pha_i3)
 
-                pha_abs = torch.sqrt(pha_feat_r ** 2 + pha_feat_i ** 2 + 1e-8)
-                mag_in_fuse = self.mid_in_proj_mag[idx](mag_feat)
-                pha_in_fuse = self.mid_in_proj_pha[idx](pha_abs)
-
-                mag_fused, pha_r3, pha_i3 = self.mid_fusions[idx](
-                    mag_in_fuse=mag_in_fuse,
-                    pha_abs_in_fuse=pha_in_fuse,
-                    mag_gate_feat=mag_feat,
-                    pha_res_r=pha_res_r,
-                    pha_res_i=pha_res_i,
-                    pha_feat_r=pha_feat_r,
-                    pha_feat_i=pha_feat_i,
+            pha_abs = torch.sqrt(pha_feat_r ** 2 + pha_feat_i ** 2 + 1e-8)
+            mag_in_fuse = self.mid_in_proj_mag[idx](mag_feat)
+            pha_in_fuse = self.mid_in_proj_pha[idx](pha_abs)
+            if mag_in_fuse.shape[-2:] != pha_in_fuse.shape[-2:]:
+                raise RuntimeError(
+                    f"mid fusion spatial mismatch: mag_in_fuse={mag_in_fuse.shape}, "
+                    f"pha_in_fuse={pha_in_fuse.shape}"
                 )
 
-                mag_cat = torch.cat([mag_feat, mag_fused], dim=1)
-                mag_x3 = self.mid_fusion_proj_mag[idx](mag_cat)
-                mag_x3 = mag_x3 + mag_res
-        else:
-            pha_x1 = self.pha_encoder(pha_in)
-            pha_copy1 = pha_x1
-            pha_x1 = self.pha_patch_embed_encoder_level1(pha_x1)
-            for block in self.pha_TSMamba1_encoder:
-                pha_x1 = block(pha_x1)
-            pha_x1 = pha_copy1 + pha_x1
-            pha_skip1 = pha_x1
+            mag_fused, pha_r3, pha_i3 = self.mid_fusions[idx](
+                mag_in_fuse=mag_in_fuse,
+                pha_abs_in_fuse=pha_in_fuse,
+                mag_gate_feat=mag_feat,
+                pha_res_r=pha_res_r,
+                pha_res_i=pha_res_i,
+                pha_feat_r=pha_feat_r,
+                pha_feat_i=pha_feat_i,
+            )
 
-            pha_x2 = self.pha_down1_2(pha_x1)
-            pha_copy2 = pha_x2
-            pha_x2 = self.pha_patch_embed_encoder_level2(pha_x2)
-            for block in self.pha_TSMamba2_encoder:
-                pha_x2 = block(pha_x2)
-            pha_x2 = pha_copy2 + pha_x2
-            pha_skip2 = pha_x2
-
-            pha_x3 = self.pha_down2_3(pha_x2)
-            pha_x3 = self.pha_patch_embed_middle(pha_x3)
-
-            if self.enable_complex_phase_bottleneck:
-                # Complex phase bottleneck.
-                # The phase stream is converted to complex once before middle stages,
-                # processed by complex Eq-Mamba blocks and GRE-safe VSS fusion,
-                # then projected back to real features for the existing decoder.
-                pha_x3_real_res = pha_x3
-                pha_r, pha_i = self.pha_mid_to_complex(pha_x3)
-                for idx, (mag_block, pha_block) in enumerate(stage_pairs):
-                    mag_res = mag_x3
-                    pha_res_r, pha_res_i = pha_r, pha_i
-
-                    mag_feat = mag_block(mag_x3)
-                    pha_feat_r, pha_feat_i = pha_block(pha_r, pha_i)
-
-                    pha_abs = torch.sqrt(pha_feat_r ** 2 + pha_feat_i ** 2 + 1e-8)
-                    mag_in_fuse = self.mid_in_proj_mag[idx](mag_feat)
-                    pha_in_fuse = self.mid_in_proj_pha[idx](pha_abs)
-
-                    mag_fused, pha_r, pha_i = self.mid_fusions[idx](
-                        mag_in_fuse=mag_in_fuse,
-                        pha_abs_in_fuse=pha_in_fuse,
-                        mag_gate_feat=mag_feat,
-                        pha_res_r=pha_res_r,
-                        pha_res_i=pha_res_i,
-                        pha_feat_r=pha_feat_r,
-                        pha_feat_i=pha_feat_i,
-                    )
-
-                    mag_cat = torch.cat([mag_feat, mag_fused], dim=1)
-                    mag_x3 = self.mid_fusion_proj_mag[idx](mag_cat)
-                    mag_x3 = mag_x3 + mag_res
-
-                pha_x3_complex_real = self.pha_mid_to_real(pha_r, pha_i)
-                if self.pha_mid_to_real_residual:
-                    pha_x3 = pha_x3_real_res + pha_x3_complex_real
-                else:
-                    pha_x3 = pha_x3_complex_real
-            else:
-                for idx, (mag_block, pha_block) in enumerate(stage_pairs):
-                    mag_res, pha_res = mag_x3, pha_x3
-                    mag_feat = mag_block(mag_x3)
-                    pha_feat = pha_block(pha_x3)
-
-                    mag_in_fuse = self.mid_in_proj_mag[idx](mag_feat)
-                    pha_in_fuse = self.mid_in_proj_pha[idx](pha_feat)
-                    mag_fused, pha_fused = self.mid_fusions[idx](mag_in_fuse, pha_in_fuse)
-
-                    mag_cat = torch.cat([mag_feat, mag_fused], dim=1)
-                    pha_cat = torch.cat([pha_feat, pha_fused], dim=1)
-                    mag_x3 = self.mid_fusion_proj_mag[idx](mag_cat)
-                    pha_x3 = self.mid_fusion_proj_pha[idx](pha_cat)
-                    # 保持残差链路
-                    mag_x3 = mag_x3 + mag_res
-                    pha_x3 = pha_x3 + pha_res
+            mag_cat = torch.cat([mag_feat, mag_fused], dim=1)
+            mag_x3 = self.mid_fusion_proj_mag[idx](mag_cat)
+            mag_x3 = mag_x3 + mag_res
 
         # ---------------------------
         # Decoder Level2 (after upsample+concat -> mamba -> residual)
@@ -792,29 +677,19 @@ class MambaSEUNet(nn.Module):
             mag_y2 = block(mag_y2)
         mag_y2 = mag_y2_copy + mag_y2
 
-        if self.use_full_phase_gre:
-            pha_r2d, pha_i2d = self.pha_complex_up3_2(pha_r3, pha_i3)
-            pha_r2d, pha_i2d = self.pha_complex_concat_level2(
-                pha_r2d,
-                pha_i2d,
-                pha_skip2_r,
-                pha_skip2_i,
-            )
-            copy_r, copy_i = pha_r2d, pha_i2d
-            pha_r2d, pha_i2d = self.pha_complex_patch_embed_decoder_level2(pha_r2d, pha_i2d)
-            for block in self.pha_complex_TSMamba2_decoder:
-                pha_r2d, pha_i2d = block(pha_r2d, pha_i2d)
-            pha_r2d = copy_r + pha_r2d
-            pha_i2d = copy_i + pha_i2d
-        else:
-            pha_y2 = self.pha_up3_2(pha_x3)
-            pha_y2 = torch.cat([pha_y2, pha_skip2], 1)
-            pha_y2 = self.pha_concat_level2(pha_y2)
-            pha_y2_copy = pha_y2
-            pha_y2 = self.pha_patch_embed_decoder_level2(pha_y2)
-            for block in self.pha_TSMamba2_decoder:
-                pha_y2 = block(pha_y2)
-            pha_y2 = pha_y2_copy + pha_y2
+        pha_r2d, pha_i2d = self.pha_complex_up3_2(pha_r3, pha_i3)
+        pha_r2d, pha_i2d = self.pha_complex_concat_level2(
+            pha_r2d,
+            pha_i2d,
+            pha_skip2_r,
+            pha_skip2_i,
+        )
+        copy_r, copy_i = pha_r2d, pha_i2d
+        pha_r2d, pha_i2d = self.pha_complex_patch_embed_decoder_level2(pha_r2d, pha_i2d)
+        for block in self.pha_complex_TSMamba2_decoder:
+            pha_r2d, pha_i2d = block(pha_r2d, pha_i2d)
+        pha_r2d = copy_r + pha_r2d
+        pha_i2d = copy_i + pha_i2d
 
         # ---------------------------
         # Decoder Level1（已移除交叉注意力）
@@ -828,29 +703,19 @@ class MambaSEUNet(nn.Module):
             mag_y1 = block(mag_y1)
         mag_y1 = mag_y1_copy + mag_y1
 
-        if self.use_full_phase_gre:
-            pha_r1d, pha_i1d = self.pha_complex_up2_1(pha_r2d, pha_i2d)
-            pha_r1d, pha_i1d = self.pha_complex_concat_level1(
-                pha_r1d,
-                pha_i1d,
-                pha_skip1_r,
-                pha_skip1_i,
-            )
-            copy_r, copy_i = pha_r1d, pha_i1d
-            pha_r1d, pha_i1d = self.pha_complex_patch_embed_decoder_level1(pha_r1d, pha_i1d)
-            for block in self.pha_complex_TSMamba1_decoder:
-                pha_r1d, pha_i1d = block(pha_r1d, pha_i1d)
-            pha_r1d = copy_r + pha_r1d
-            pha_i1d = copy_i + pha_i1d
-        else:
-            pha_y1 = self.pha_up2_1(pha_y2)
-            pha_y1 = torch.cat([pha_y1, pha_skip1], 1)
-            pha_y1 = self.pha_concat_level1(pha_y1)
-            pha_y1_copy = pha_y1
-            pha_y1 = self.pha_patch_embed_decoder_level1(pha_y1)
-            for block in self.pha_TSMamba1_decoder:
-                pha_y1 = block(pha_y1)
-            pha_y1 = pha_y1_copy + pha_y1
+        pha_r1d, pha_i1d = self.pha_complex_up2_1(pha_r2d, pha_i2d)
+        pha_r1d, pha_i1d = self.pha_complex_concat_level1(
+            pha_r1d,
+            pha_i1d,
+            pha_skip1_r,
+            pha_skip1_i,
+        )
+        copy_r, copy_i = pha_r1d, pha_i1d
+        pha_r1d, pha_i1d = self.pha_complex_patch_embed_decoder_level1(pha_r1d, pha_i1d)
+        for block in self.pha_complex_TSMamba1_decoder:
+            pha_r1d, pha_i1d = block(pha_r1d, pha_i1d)
+        pha_r1d = copy_r + pha_r1d
+        pha_i1d = copy_i + pha_i1d
 
         # Mag Refinement & Output
         mag_copy_ref = mag_y1
@@ -859,89 +724,40 @@ class MambaSEUNet(nn.Module):
             mag_y1 = block(mag_y1)
         mag_final = self.mag_output(mag_y1 + mag_copy_ref) + mag_skip1
 
-        if self.use_full_phase_gre:
-            copy_r, copy_i = pha_r1d, pha_i1d
-            pha_r1d, pha_i1d = self.pha_complex_patch_embed_refinement(pha_r1d, pha_i1d)
-            for block in self.pha_complex_refinement:
-                pha_r1d, pha_i1d = block(pha_r1d, pha_i1d)
-            pha_r_final = pha_r1d + copy_r + pha_skip1_r
-            pha_i_final = pha_i1d + copy_i + pha_skip1_i
-            pha_r_final, pha_i_final = self.pha_complex_output(pha_r_final, pha_i_final)
+        copy_r, copy_i = pha_r1d, pha_i1d
+        pha_r1d, pha_i1d = self.pha_complex_patch_embed_refinement(pha_r1d, pha_i1d)
+        for block in self.pha_complex_refinement:
+            pha_r1d, pha_i1d = block(pha_r1d, pha_i1d)
+        pha_r_final = pha_r1d + copy_r + pha_skip1_r
+        pha_i_final = pha_i1d + copy_i + pha_skip1_i
+        pha_r_final, pha_i_final = self.pha_complex_output(pha_r_final, pha_i_final)
 
-            mag_fused, pha_r_fused, pha_i_fused = self.gre_final_fusion(
-                mag_final,
-                pha_r_final,
-                pha_i_final,
-            )
+        mag_fused, pha_r_fused, pha_i_fused = self.gre_final_fusion(
+            mag_final,
+            pha_r_final,
+            pha_i_final,
+        )
 
-            pred_cos_t_f, pred_sin_t_f = self.complex_phase_head(pha_r_fused, pha_i_fused)
-            pred_cos = rearrange(pred_cos_t_f, 'b t f -> b f t')
-            pred_sin = rearrange(pred_sin_t_f, 'b t f -> b f t')
-            pred_pha = torch.atan2(pred_sin, pred_cos)
+        target_size = noisy_pha_4d.shape[-2:]
+        pred_cos_t_f, pred_sin_t_f = self.complex_phase_head(
+            pha_r_fused,
+            pha_i_fused,
+            target_size=target_size,
+        )
+        pred_cos = rearrange(pred_cos_t_f, 'b t f -> b f t')
+        pred_sin = rearrange(pred_sin_t_f, 'b t f -> b f t')
+        pred_pha = torch.atan2(pred_sin, pred_cos)
 
-            mag_mask = self.mask_decoder(self.mag_to_mask_proj(mag_fused))
-            if not torch.isfinite(mag_mask).all():
-                raise RuntimeError('mag_mask contains NaN/Inf')
-            denoised_mag = rearrange(mag_mask * noisy_mag_4d, 'b c t f -> b f t c').squeeze(-1)
-
-            denoised_com = torch.stack(
-                (denoised_mag * pred_cos,
-                 denoised_mag * pred_sin),
-                dim=-1
-            )
-            if not torch.isfinite(denoised_com).all():
-                raise RuntimeError('denoised_com contains NaN/Inf')
-
-            return denoised_mag, pred_pha, denoised_com
-
-        # Pha Refinement & Output
-        pha_copy_ref = pha_y1
-        pha_y1 = self.pha_patch_embed_refinement(pha_y1)
-        for block in self.pha_refinement:
-            pha_y1 = block(pha_y1)
-        pha_final = self.pha_output(pha_y1 + pha_copy_ref) + pha_skip1
-
-        # Final耦合融合（相位先升维到 Mag 再交互，输出后压回相位宽度）
-        mag_fused, pha_fused_high = self.global_fusion(mag_final, self.global_in_proj_pha(pha_final))
-        pha_fused = self.global_out_proj_pha(torch.cat([pha_final, pha_fused_high], dim=1))
-
-        if not torch.isfinite(pha_fused).all():
-             raise RuntimeError('pha_fused contains NaN/Inf before pha_pre_decoder_ffn')
-        pha_fused = self.pha_pre_decoder_ffn(pha_fused)
-        if not torch.isfinite(pha_fused).all():
-             raise RuntimeError('pha_fused contains NaN/Inf after pha_pre_decoder_ffn')
-
-        # ---------------------------
-        # Final Signal Reconstruction
-        # ---------------------------
         mag_mask = self.mask_decoder(self.mag_to_mask_proj(mag_fused))
         if not torch.isfinite(mag_mask).all():
             raise RuntimeError('mag_mask contains NaN/Inf')
         denoised_mag = rearrange(mag_mask * noisy_mag_4d, 'b c t f -> b f t c').squeeze(-1)
 
-        # Phase residual (tanh*pi) then add to noisy_pha
-        if not torch.isfinite(denoised_mag).all():
-            raise RuntimeError('denoised_mag contains NaN/Inf')
-        rot_vec = self.phase_decoder(pha_fused)
-        rot_vec = F.normalize(rot_vec, dim=1, p=2, eps=1e-8)
-        delta_cos, delta_sin = torch.chunk(rot_vec, 2, dim=1)
-        delta_cos = delta_cos.squeeze(1)  # [B, T, F]
-        delta_sin = delta_sin.squeeze(1)
-
-        # 直接基于 noisy_pha 计算 sin/cos
-        noisy_cos = torch.cos(noisy_pha_4d).squeeze(1)  # [B, T, F]
-        noisy_sin = torch.sin(noisy_pha_4d).squeeze(1)  # [B, T, F]
-
-        pred_cos = noisy_cos * delta_cos - noisy_sin * delta_sin
-        pred_sin = noisy_sin * delta_cos + noisy_cos * delta_sin
-
-        # 对齐到 [B, F, T] 以匹配幅度分支
-        pred_cos = rearrange(pred_cos, 'b t f -> b f t')
-        pred_sin = rearrange(pred_sin, 'b t f -> b f t')
-
-        pred_pha = torch.atan2(pred_sin, pred_cos)
-        if not torch.isfinite(pred_pha).all():
-            raise RuntimeError('pred_pha contains NaN/Inf')
+        if pred_cos.shape != denoised_mag.shape:
+            raise RuntimeError(
+                f"phase/magnitude output mismatch: pred_cos={pred_cos.shape}, "
+                f"denoised_mag={denoised_mag.shape}"
+            )
 
         denoised_com = torch.stack(
             (denoised_mag * pred_cos,

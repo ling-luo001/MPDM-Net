@@ -164,18 +164,15 @@ model_cfg:
   cross_global_window: 8    # 头/尾全局 token
   cross_sparsity: 0.9       # 稀疏率，越大越稀疏
   num_mid_pairs : 3
-  use_eq_phase_mamba: true
-  eq_phase_mamba_scope: middle
   eq_mamba_res_scale: 1.0
   eq_mamba_dropout: 0.0
   eq_mamba_bidirectional: true
   eq_mamba_use_complex_conv: true
-  use_full_phase_gre: true
-  use_complex_phase_bottleneck: true
-  use_gre_mid_fusion: true
-  use_pha_pre_decoder_ffn: true
+  full_phase_stem_freq_stride: 2
+  full_phase_stem_use_post_conv: false
+  phase_head_upsample_mode: bilinear
   gre_fusion_scale: 1.0
-  pha_mid_to_real_residual: true
+  use_complex_phase_refine_ffn: true
   pha_ffn_dropout: 0.0
   pha_ffn_res_scale: 1.0
   pha_ffn_expansion: 4

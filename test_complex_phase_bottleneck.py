@@ -4,7 +4,6 @@ import pytest
 import torch
 
 from models.cross import GREVSSMidFusion
-from models.generator import MambaSEUNet
 from models.mamba_block import (
     ComplexEqTMambaBlock,
     ComplexEqFMambaBlock,
@@ -39,17 +38,11 @@ def _get_cfg():
             "cross_sparse_window": 64,
             "cross_global_window": 8,
             "cross_sparsity": 0.9,
-            "use_eq_phase_mamba": True,
-            "eq_phase_mamba_scope": "middle",
-            "use_complex_phase_bottleneck": True,
-            "use_gre_mid_fusion": True,
-            "use_pha_pre_decoder_ffn": True,
             "eq_mamba_res_scale": 1.0,
             "eq_mamba_dropout": 0.0,
             "eq_mamba_bidirectional": True,
             "eq_mamba_use_complex_conv": True,
             "gre_fusion_scale": 1.0,
-            "pha_mid_to_real_residual": True,
             "pha_ffn_dropout": 0.0,
             "pha_ffn_res_scale": 1.0,
         },
