@@ -10,6 +10,7 @@ from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
 from .cross import VSSBlock_Cross_new
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
 import torch.nn.functional as F
+from .transformer_e import ComplexRMSNorm, ComplexFFN
 
 
 #####################################
@@ -143,6 +144,48 @@ class Upsample(nn.Module):
 
     def forward(self, x):
         return self.body(x)
+
+
+class PhaFFNAdapter2D(nn.Module):
+    """GRE-inspired Pha-FFN refinement before phase decoder.
+
+    This module introduces a complex-valued gated FFN style refinement
+    for phase features while keeping the original PhaseDecoder interface unchanged.
+    """
+
+    def __init__(self, channels, dropout=0.0, res_scale=0.1):
+        super().__init__()
+        self.channels = channels
+        self.to_complex = nn.Conv2d(channels, channels * 2, kernel_size=1, bias=False)
+        self.cnorm_in = ComplexRMSNorm(channels)
+        self.ang_ffn = ComplexFFN(channels, dropout=dropout)
+        self.cnorm_out = ComplexRMSNorm(channels)
+        self.to_real = nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False)
+        self.res_scale = nn.Parameter(torch.tensor(res_scale))
+
+    def forward(self, x):
+        # x: [B, C, T, F]
+        B, C, T, F = x.shape
+        x_ri = self.to_complex(x)
+        x_r, x_i = torch.chunk(x_ri, 2, dim=1)
+
+        # [B, C, T, F] -> [B, L, C]
+        x_r = rearrange(x_r, 'b c t f -> b (t f) c')
+        x_i = rearrange(x_i, 'b c t f -> b (t f) c')
+
+        x_r_t, x_i_t = self.cnorm_in(x_r, x_i)
+        y_r, y_i = self.ang_ffn(x_r_t, x_i_t)
+        x_r = x_r + y_r
+        x_i = x_i + y_i
+        x_r, x_i = self.cnorm_out(x_r, x_i)
+
+        # [B, L, C] -> [B, C, T, F]
+        x_r = rearrange(x_r, 'b (t f) c -> b c t f', t=T, f=F)
+        x_i = rearrange(x_i, 'b (t f) c -> b c t f', t=T, f=F)
+
+        x_ri = torch.cat([x_r, x_i], dim=1)
+        y = self.to_real(x_ri)
+        return x + self.res_scale * y
 
 
 class MambaSEUNet(nn.Module):
@@ -300,6 +343,15 @@ class MambaSEUNet(nn.Module):
         pha_dec_cfg = deepcopy(cfg)
         pha_dec_cfg['model_cfg']['hid_feature'] = pha_base
         self.phase_decoder = PhaseDecoder(pha_dec_cfg)
+        self.use_pha_pre_decoder_ffn = cfg['model_cfg'].get('use_pha_pre_decoder_ffn', False)
+        if self.use_pha_pre_decoder_ffn:
+            self.pha_pre_decoder_ffn = PhaFFNAdapter2D(
+                channels=pha_dim[0],
+                dropout=cfg['model_cfg'].get('pha_ffn_dropout', 0.0),
+                res_scale=cfg['model_cfg'].get('pha_ffn_res_scale', 0.1)
+            )
+        else:
+            self.pha_pre_decoder_ffn = nn.Identity()
 
     def forward(self, noisy_mag, noisy_pha):
         if not torch.isfinite(noisy_mag).all():
@@ -454,7 +506,12 @@ class MambaSEUNet(nn.Module):
         pha_fused = self.global_out_proj_pha(torch.cat([pha_final, pha_fused_high], dim=1))
 
         if not torch.isfinite(pha_fused).all():
-             raise RuntimeError('pha_fused contains NaN/Inf')
+             raise RuntimeError('pha_fused contains NaN/Inf before pha_pre_decoder_ffn')
+
+        pha_fused = self.pha_pre_decoder_ffn(pha_fused)
+
+        if not torch.isfinite(pha_fused).all():
+             raise RuntimeError('pha_fused contains NaN/Inf after pha_pre_decoder_ffn')
 
         # ---------------------------
         # Final Signal Reconstruction

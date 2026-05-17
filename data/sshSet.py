@@ -1,4 +1,4 @@
-`# 1. 安装并启动 SSH 服务
+# 1. 安装并启动 SSH 服务
 # 更新软件包列表并安装 OpenSSH 服务端：
 #
 # Bash
@@ -21,6 +21,8 @@
 # Bash
 # ip a
 #
+# 127.0.0.1/8
+
 # (base) lz@lz-System-Product-Name:~$ ip a
 # 1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
 #     link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
