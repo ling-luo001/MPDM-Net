@@ -724,6 +724,7 @@ class SS2D(nn.Module):
         out = self.dropout(self.out_proj(y))
         return out
 
+
 class BiAttn(nn.Module):
     def __init__(self, in_channels, act_ratio=0.125, act_fn=nn.GELU, gate_fn=nn.Sigmoid):
         super().__init__()
@@ -870,9 +871,10 @@ class Cross_layer(nn.Module):
 
         return F_1, F_2
 
-class SS2D_cross_new(nn.Module):
-    def __init__(self,
-            # basic dims ===========
+class SS2DTwoInputCross(nn.Module):
+    def __init__(
+            self,
+            # basic dims ==========
             d_model=96,
             d_state=16,
             ssm_ratio=2.0,
@@ -898,25 +900,20 @@ class SS2D_cross_new(nn.Module):
             step_size=2,
             **kwargs,
     ):
-        """
-        ssm_rank_ratio would be used in the future...
-        """
         factory_kwargs = {"device": None, "dtype": None}
         super().__init__()
         d_expand = int(ssm_ratio * d_model)
         d_inner = int(min(ssm_rank_ratio, ssm_ratio) * d_model) if ssm_rank_ratio > 0 else d_expand
         self.dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else dt_rank
-        self.d_state = math.ceil(d_model / 6) if d_state == "auto" else d_state  # 20240109
+        self.d_state = math.ceil(d_model / 6) if d_state == "auto" else d_state
         self.d_conv = d_conv
 
         self.step_size = step_size
 
-        # disable z act ======================================
         self.disable_z_act = forward_type[-len("nozact"):] == "nozact"
         if self.disable_z_act:
             forward_type = forward_type[:-len("nozact")]
 
-        # softmax | sigmoid | norm ===========================
         if forward_type[-len("softmax"):] == "softmax":
             forward_type = forward_type[:-len("softmax")]
             self.out_norm = nn.Softmax(dim=1)
@@ -926,7 +923,6 @@ class SS2D_cross_new(nn.Module):
         else:
             self.out_norm = nn.LayerNorm(d_inner)
 
-        # forward_type =======================================
         self.forward_core = dict(
             v0=self.forward_corev0,
             v0_seq=self.forward_corev0_seq,
@@ -938,13 +934,11 @@ class SS2D_cross_new(nn.Module):
         self.K = 4 if forward_type not in ["share_ssm"] else 1
         self.K2 = self.K if forward_type not in ["share_a"] else 1
 
-        # in proj =======================================
         self.in_proj1 = nn.Linear(d_model, d_expand * 2, bias=bias, **factory_kwargs)
         self.in_proj2 = nn.Linear(d_model, d_expand * 2, bias=bias, **factory_kwargs)
         self.act1: nn.Module = act_layer()
         self.act2: nn.Module = act_layer()
 
-        # conv =======================================
         if self.d_conv > 1:
             self.conv2d = nn.Conv2d(
                 in_channels=d_expand,
@@ -956,14 +950,12 @@ class SS2D_cross_new(nn.Module):
                 **factory_kwargs,
             )
 
-        # rank ratio =====================================
         self.ssm_low_rank = False
         if d_inner < d_expand:
             self.ssm_low_rank = True
             self.in_rank = nn.Conv2d(d_expand, d_inner, kernel_size=1, bias=False, **factory_kwargs)
             self.out_rank = nn.Linear(d_inner, d_expand, bias=False, **factory_kwargs)
 
-        # x proj ============================
         self.x_proj = [
             nn.Linear(d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs)
             for _ in range(self.K)
@@ -971,7 +963,6 @@ class SS2D_cross_new(nn.Module):
         self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K, N, inner)
         del self.x_proj
 
-        # dt proj ============================
         self.dt_projs = [
             self.dt_init(self.dt_rank, d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor, **factory_kwargs)
             for _ in range(self.K)
@@ -980,20 +971,18 @@ class SS2D_cross_new(nn.Module):
         self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))  # (K, inner)
         del self.dt_projs
 
-        # A, D =======================================
         self.A_logs = self.A_log_init(self.d_state, d_inner, copies=self.K2, merge=True)  # (K * D, N)
         self.Ds = self.D_init(d_inner, copies=self.K2, merge=True)  # (K * D)
 
-        # out proj =======================================
         self.out_proj1 = nn.Linear(d_expand, d_model, bias=bias, **factory_kwargs)
         self.out_proj2 = nn.Linear(d_expand, d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
 
         if simple_init:
-            # simple init dt_projs, A_logs, Ds
             self.Ds = nn.Parameter(torch.ones((self.K2 * d_inner)))
             self.A_logs = nn.Parameter(
-                torch.randn((self.K2 * d_inner, self.d_state)))  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+                torch.randn((self.K2 * d_inner, self.d_state))
+            )
             self.dt_projs_weight = nn.Parameter(torch.randn((self.K, d_inner, self.dt_rank)))
             self.dt_projs_bias = nn.Parameter(torch.randn((self.K, d_inner)))
 
@@ -1001,8 +990,6 @@ class SS2D_cross_new(nn.Module):
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
                 **factory_kwargs):
         dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
-
-        # Initialize special dt projection to preserve variance at initialization
         dt_init_std = dt_rank ** -0.5 * dt_scale
         if dt_init == "constant":
             nn.init.constant_(dt_proj.weight, dt_init_std)
@@ -1011,12 +998,10 @@ class SS2D_cross_new(nn.Module):
         else:
             raise NotImplementedError
 
-        # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
             torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
             dt_proj.bias.copy_(inv_dt)
@@ -1031,7 +1016,7 @@ class SS2D_cross_new(nn.Module):
             "n -> d n",
             d=d_inner,
         ).contiguous()
-        A_log = torch.log(A)  # Keep A_log in fp32
+        A_log = torch.log(A)
         if copies > 0:
             A_log = repeat(A_log, "d n -> r d n", r=copies)
             if merge:
@@ -1048,15 +1033,11 @@ class SS2D_cross_new(nn.Module):
             D = repeat(D, "n1 -> r n1", r=copies)
             if merge:
                 D = D.flatten(0, 1)
-        D = nn.Parameter(D)  # Keep in fp32
+        D = nn.Parameter(D)
         D._no_weight_decay = True
         return D
 
-    # only used to run previous version
     def forward_corev0(self, x: torch.Tensor, to_dtype=False, channel_first=False):
-        # def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True, nrows=1):
-        #     return SelectiveScan.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
-
         self.selective_scan = selective_scan_fn
 
         if not channel_first:
@@ -1067,24 +1048,20 @@ class SS2D_cross_new(nn.Module):
 
         x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)],
                              dim=1).view(B, 2, -1, L)
-        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)  # (b, k, d, l)
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)
 
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs, self.x_proj_weight)
-        # x_dbl = x_dbl + self.x_proj_bias.view(1, K, -1, 1)
         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
         dts = torch.einsum("b k r l, k d r -> b k d l", dts, self.dt_projs_weight)
 
-        xs = xs.float().view(B, -1, L)  # (b, k * d, l)
-        dts = dts.contiguous().float().view(B, -1, L)  # (b, k * d, l)
-        Bs = Bs.float()  # (b, k, d_state, l)
-        Cs = Cs.float()  # (b, k, d_state, l)
+        xs = xs.float().view(B, -1, L)
+        dts = dts.contiguous().float().view(B, -1, L)
+        Bs = Bs.float()
+        Cs = Cs.float()
 
-        As = -torch.exp(self.A_logs.float())  # (k * d, d_state)
-        Ds = self.Ds.float()  # (k * d)
-        dt_projs_bias = self.dt_projs_bias.float().view(-1)  # (k * d)
-
-        # assert len(xs.shape) == 3 and len(dts.shape) == 3 and len(Bs.shape) == 4 and len(Cs.shape) == 4
-        # assert len(As.shape) == 2 and len(Ds.shape) == 1 and len(dt_projs_bias.shape) == 1
+        As = -torch.exp(self.A_logs.float())
+        Ds = self.Ds.float()
+        dt_projs_bias = self.dt_projs_bias.float().view(-1)
 
         out_y = self.selective_scan(
             xs, dts,
@@ -1092,13 +1069,12 @@ class SS2D_cross_new(nn.Module):
             delta_bias=dt_projs_bias,
             delta_softplus=True,
         ).view(B, K, -1, L)
-        # assert out_y.dtype == torch.float
 
         inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
         wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
         invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
         y = out_y[:, 0] + inv_y[:, 0] + wh_y + invwh_y
-        y = y.transpose(dim0=1, dim1=2).contiguous()  # (B, L, C)
+        y = y.transpose(dim0=1, dim1=2).contiguous()
         y = self.out_norm(y).view(B, H, W, -1)
 
         return (y.to(x.dtype) if to_dtype else y)
@@ -1115,21 +1091,20 @@ class SS2D_cross_new(nn.Module):
 
         x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)],
                              dim=1).view(B, 2, -1, L)
-        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)  # (b, k, d, l)
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)
 
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs, self.x_proj_weight)
-        # x_dbl = x_dbl + self.x_proj_bias.view(1, K, -1, 1)
         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
         dts = torch.einsum("b k r l, k d r -> b k d l", dts, self.dt_projs_weight)
 
-        xs = xs.float()  # (b, k, d, l)
-        dts = dts.contiguous().float()  # (b, k, d, l)
-        Bs = Bs.float()  # (b, k, d_state, l)
-        Cs = Cs.float()  # (b, k, d_state, l)
+        xs = xs.float()
+        dts = dts.contiguous().float()
+        Bs = Bs.float()
+        Cs = Cs.float()
 
-        As = -torch.exp(self.A_logs.float()).view(K, -1, self.d_state)  # (k, d, d_state)
-        Ds = self.Ds.float().view(K, -1)  # (k, d)
-        dt_projs_bias = self.dt_projs_bias.float().view(K, -1)  # (k, d)
+        As = -torch.exp(self.A_logs.float()).view(K, -1, self.d_state)
+        Ds = self.Ds.float().view(K, -1)
+        dt_projs_bias = self.dt_projs_bias.float().view(K, -1)
 
         out_y = []
         for i in range(4):
@@ -1141,27 +1116,20 @@ class SS2D_cross_new(nn.Module):
             ).view(B, -1, L)
             out_y.append(yi)
         out_y = torch.stack(out_y, dim=1)
-        assert out_y.dtype == torch.float
 
         inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
         wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
         invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
         y = out_y[:, 0] + inv_y[:, 0] + wh_y + invwh_y
-        y = y.transpose(dim0=1, dim1=2).contiguous()  # (B, L, C)
+        y = y.transpose(dim0=1, dim1=2).contiguous()
         y = self.out_norm(y).view(B, H, W, -1)
 
         return (y.to(x.dtype) if to_dtype else y)
 
     def forward_corev0_share_ssm(self, x: torch.Tensor, channel_first=False):
-        """
-        we may conduct this ablation later, but not with v0.
-        """
         ...
 
     def forward_corev0_share_a(self, x: torch.Tensor, channel_first=False):
-        """
-        we may conduct this ablation later, but not with v0.
-        """
         ...
 
     def forward_corev2(self, x1: torch.Tensor, x2: torch.Tensor, nrows=-1, channel_first=False, step_size=2):
@@ -1175,7 +1143,7 @@ class SS2D_cross_new(nn.Module):
         y1, y2 = cross_selective_scan_cross(
             x1, x2, self.x_proj_weight, None, self.dt_projs_weight, self.dt_projs_bias,
             self.A_logs, self.Ds, getattr(self, "out_norm", None),
-            nrows=nrows, delta_softplus=True, step_size=1
+            nrows=nrows, delta_softplus=True, step_size=step_size
         )
         if self.ssm_low_rank:
             y1 = self.out_rank(y1)
@@ -1186,25 +1154,25 @@ class SS2D_cross_new(nn.Module):
         xz1 = self.in_proj1(x1)
         xz2 = self.in_proj2(x2)
         if self.d_conv > 1:
-            x1, z1 = xz1.chunk(2, dim=-1)  # (b, h, w, d)
-            x2, z2 = xz2.chunk(2, dim=-1)  # (b, h, w, d)
+            x1, z1 = xz1.chunk(2, dim=-1)
+            x2, z2 = xz2.chunk(2, dim=-1)
             if not self.disable_z_act:
                 z1 = self.act1(z1)
                 z2 = self.act2(z2)
             x1 = x1.permute(0, 3, 1, 2).contiguous()
             x2 = x2.permute(0, 3, 1, 2).contiguous()
-            x1 = self.act1(self.conv2d(x1))  # (b, d, h, w)
+            x1 = self.act1(self.conv2d(x1))
             x2 = self.act2(self.conv2d(x2))
         else:
             if self.disable_z_act:
-                x1, z1 = xz1.chunk(2, dim=-1)  # (b, h, w, d)
-                x2, z2 = xz2.chunk(2, dim=-1)  # (b, h, w, d)
+                x1, z1 = xz1.chunk(2, dim=-1)
+                x2, z2 = xz2.chunk(2, dim=-1)
                 x1 = self.act1(x1)
                 x2 = self.act2(x2)
             else:
                 xz1 = self.act1(xz1)
                 xz2 = self.act2(xz2)
-                x1, z1 = xz1.chunk(2, dim=-1)  # (b, h, w, d)
+                x1, z1 = xz1.chunk(2, dim=-1)
                 x2, z2 = xz2.chunk(2, dim=-1)
         y1, y2 = self.forward_core(x1, x2, channel_first=(self.d_conv > 1), step_size=1)
         y1 = y1 * z1
@@ -1257,7 +1225,7 @@ class VSSBlock_Cross_new(nn.Module):
         self.ln_1 = norm_layer(hidden_dim)
         self.ln_2 = norm_layer(hidden_dim)
         self.Cross_layer = Cross_layer(hidden_dim)
-        self.self_attention_cross = SS2D_cross_new(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, **kwargs)
+        self.self_attention_cross = SS2DTwoInputCross(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, **kwargs)
         # 分支 ECA 独立
         self.eca_1 = eca_layer(channel=hidden_dim)
         self.eca_2 = eca_layer(channel=hidden_dim)
@@ -1297,3 +1265,58 @@ class VSSBlock_Cross_new(nn.Module):
         out2 = input2 + self.drop_path(self.post_ln_2((mamba_out2_cf + att_2).permute(0, 2, 3, 1)).permute(0, 3, 1, 2))
 
         return out1, out2
+
+
+class GREVSSMidFusion(nn.Module):
+    # GRE-safe VSS middle fusion.
+    # VSSBlock_Cross_new is used only as a real-valued invariant context extractor.
+    # The phase input to VSS is |P|, not raw complex phase.
+    # The VSS phase-side output is not added to the complex phase stream.
+    # It is used only to generate real-valued modulation for complex phase updates.
+    def __init__(
+        self,
+        hidden_dim: int,
+        phase_channels: int,
+        cfg,
+        drop_path: float = 0,
+        attn_drop_rate: float = 0,
+        d_state: int = 16,
+    ):
+        super().__init__()
+        self.vss_context = VSSBlock_Cross_new(
+            hidden_dim=hidden_dim,
+            drop_path=drop_path,
+            attn_drop_rate=attn_drop_rate,
+            d_state=d_state,
+        )
+        gate_in_channels = hidden_dim * 3
+        self.phase_mod_gate = nn.Sequential(
+            nn.Conv2d(gate_in_channels, phase_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=1, num_channels=phase_channels),
+            nn.SiLU(),
+            nn.Conv2d(phase_channels, phase_channels, kernel_size=1, bias=True),
+        )
+        nn.init.zeros_(self.phase_mod_gate[-1].weight)
+        nn.init.zeros_(self.phase_mod_gate[-1].bias)
+        self.gre_fusion_scale = nn.Parameter(torch.tensor(cfg['model_cfg'].get('gre_fusion_scale', 1.0)))
+
+    def forward(
+        self,
+        mag_in_fuse,
+        pha_abs_in_fuse,
+        mag_gate_feat,
+        pha_res_r,
+        pha_res_i,
+        pha_feat_r,
+        pha_feat_i,
+    ):
+        mag_fused, pha_ctx = self.vss_context(mag_in_fuse, pha_abs_in_fuse)
+        gate_in = torch.cat([mag_gate_feat, mag_fused, pha_ctx], dim=1)
+        gate_logits = self.phase_mod_gate(gate_in)
+        mod = 1.0 + self.gre_fusion_scale * torch.tanh(gate_logits)
+
+        delta_r = pha_feat_r - pha_res_r
+        delta_i = pha_feat_i - pha_res_i
+        pha_out_r = pha_res_r + mod * delta_r
+        pha_out_i = pha_res_i + mod * delta_i
+        return mag_fused, pha_out_r, pha_out_i

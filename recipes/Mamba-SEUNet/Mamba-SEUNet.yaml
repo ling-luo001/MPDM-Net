@@ -170,3 +170,13 @@ model_cfg:
   eq_mamba_dropout: 0.0
   eq_mamba_bidirectional: true
   eq_mamba_use_complex_conv: true
+  use_complex_phase_bottleneck: true
+  use_gre_mid_fusion: true
+  use_pha_pre_decoder_ffn: true
+  gre_fusion_scale: 1.0
+  pha_mid_to_real_residual: true
+  pha_ffn_dropout: 0.0
+  pha_ffn_res_scale: 1.0
+  pha_ffn_expansion: 4
+  pha_ffn_use_complex_conv: true
+  pha_ffn_kernel_size: 3

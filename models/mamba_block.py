@@ -382,6 +382,69 @@ class EqFMambaBlock(nn.Module):
         return y
 
 
+class ComplexEqTMambaBlock(nn.Module):
+    def __init__(self, cfg, inchannels):
+        super().__init__()
+        eq_mamba_res_scale = cfg['model_cfg'].get('eq_mamba_res_scale', 1.0)
+        eq_mamba_bidirectional = cfg['model_cfg'].get('eq_mamba_bidirectional', True)
+        self.hid_feature = inchannels
+        self.eq_core = EqBiMamba1D(inchannels, cfg) if eq_mamba_bidirectional else EqMamba1D(inchannels, cfg)
+        self.res_scale = nn.Parameter(torch.tensor(eq_mamba_res_scale))
+
+    def forward(self, x_r, x_i):
+        b, c, t, f = x_r.size()
+        x_r_seq = x_r.permute(0, 3, 2, 1).contiguous().view(b * f, t, c)
+        x_i_seq = x_i.permute(0, 3, 2, 1).contiguous().view(b * f, t, c)
+        dy_r, dy_i = self.eq_core(x_r_seq, x_i_seq)
+        y_r_seq = x_r_seq + self.res_scale * dy_r
+        y_i_seq = x_i_seq + self.res_scale * dy_i
+        y_r = y_r_seq.view(b, f, t, c).permute(0, 3, 2, 1).contiguous()
+        y_i = y_i_seq.view(b, f, t, c).permute(0, 3, 2, 1).contiguous()
+        return y_r, y_i
+
+
+class ComplexEqFMambaBlock(nn.Module):
+    def __init__(self, cfg, inchannels):
+        super().__init__()
+        eq_mamba_res_scale = cfg['model_cfg'].get('eq_mamba_res_scale', 1.0)
+        eq_mamba_bidirectional = cfg['model_cfg'].get('eq_mamba_bidirectional', True)
+        self.hid_feature = inchannels
+        self.eq_core = EqBiMamba1D(inchannels, cfg) if eq_mamba_bidirectional else EqMamba1D(inchannels, cfg)
+        self.res_scale = nn.Parameter(torch.tensor(eq_mamba_res_scale))
+
+    def forward(self, x_r, x_i):
+        b, c, t, f = x_r.size()
+        x_r_seq = x_r.permute(0, 2, 3, 1).contiguous().view(b * t, f, c)
+        x_i_seq = x_i.permute(0, 2, 3, 1).contiguous().view(b * t, f, c)
+        dy_r, dy_i = self.eq_core(x_r_seq, x_i_seq)
+        y_r_seq = x_r_seq + self.res_scale * dy_r
+        y_i_seq = x_i_seq + self.res_scale * dy_i
+        y_r = y_r_seq.view(b, t, f, c).permute(0, 3, 1, 2).contiguous()
+        y_i = y_i_seq.view(b, t, f, c).permute(0, 3, 1, 2).contiguous()
+        return y_r, y_i
+
+
+class PhaseMidToComplex2D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.proj = nn.Conv2d(channels, 2 * channels, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        x_ri = self.proj(x)
+        x_r, x_i = torch.chunk(x_ri, 2, dim=1)
+        return x_r, x_i
+
+
+class PhaseMidToReal2D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.proj = nn.Conv2d(2 * channels, channels, kernel_size=1, bias=False)
+
+    def forward(self, x_r, x_i):
+        x = self.proj(torch.cat([x_r, x_i], dim=1))
+        return x
+
+
 class CoupledMambaFusion(nn.Module):
     """Simple mag/pha融合: 可选预归一化，concat -> reduce -> gate，零初始化保证初始不融合。"""
 
@@ -711,4 +774,3 @@ class CBAM(nn.Module):
         out = x * self.ca(x)
         result = out * self.sa(out)
         return result
-
