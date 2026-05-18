@@ -41,7 +41,7 @@ sudo systemctl status ssh
 hostname -I
 
 会输出类似：
-g515528@515528
+g515528
 192.168.123.156
 
 
