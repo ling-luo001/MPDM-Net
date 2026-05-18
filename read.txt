@@ -5,3 +5,81 @@ WARNING conda.models.version:get_matcher(556): Using .* with relational operator
 WARNING conda.models.version:get_matcher(556): Using .* with relational operator is superfluous and deprecated and will be removed in a future version of conda. Your spec was 1.9.0.*, but conda is ignoring the .* and treating it as 1.9.0
 WARNING conda.models.version:get_matcher(556): Using .* with relational operator is superfluous and deprecated and will be removed in a future version of conda. Your spec was 1.6.0.*, but conda is ignoring the .* and tr
 eating it as 1.6.0
+
+在服务器终端执行：
+
+sudo apt update
+sudo apt install openssh-server
+
+安装完成后检查状态：
+
+sudo systemctl status ssh
+
+如果看到类似：
+
+active (running)
+
+说明 SSH 服务已经启动。
+
+2. 启动 SSH 服务
+
+如果没有启动，执行：
+
+sudo systemctl start ssh
+
+设置开机自启：
+
+sudo systemctl enable ssh
+
+再次检查：
+
+sudo systemctl status ssh
+3. 查看服务器 IP
+
+在服务器上执行：
+
+hostname -I
+
+会输出类似：
+
+192.168.1.120
+
+这个就是你本地连接时要用的服务器 IP。
+
+也可以用：
+
+ip addr
+
+看网卡对应的 IP。
+
+4. 检查 SSH 端口
+
+默认 SSH 端口是 22。
+
+查看 SSH 是否在监听：
+
+sudo ss -tlnp | grep ssh
+
+正常会看到类似：
+
+LISTEN 0 128 0.0.0.0:22
+
+说明 SSH 正在监听 22 端口。
+
+5. 配置防火墙
+
+如果服务器开了 ufw 防火墙，先查看：
+
+sudo ufw status
+
+如果是 active，需要放行 SSH：
+
+sudo ufw allow ssh
+
+或者直接放行 22 端口：
+
+sudo ufw allow 22
+
+然后重新加载：
+
+sudo ufw reload
