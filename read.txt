@@ -6,6 +6,9 @@ WARNING conda.models.version:get_matcher(556): Using .* with relational operator
 WARNING conda.models.version:get_matcher(556): Using .* with relational operator is superfluous and deprecated and will be removed in a future version of conda. Your spec was 1.6.0.*, but conda is ignoring the .* and tr
 eating it as 1.6.0
 
+python -u -m pytest -s test_full_phase_gre_branch.py && python -u -m pytest -s test_eq_mamba_v1.py && python -u -m pytest -s test_pha_ffn_adapter.py
+python -c "import torch; from models.generator import MambaSEUNet; cfg={'model_cfg':{'hid_feature':16,'dense_channel':16,'compress_factor':0.3,'num_tfmamba':2,'num_mid_pairs':2,'d_state':16,'d_conv':4,'expand':4,'norm_epsilon':1e-5,'beta':2.0,'input_channel':2,'output_channel':1,'cross_pool_t':1,'cross_pool_f':1,'cross_sparse_window':64,'cross_global_window':8,'cross_sparsity':0.9,'eq_mamba_res_scale':1.0,'eq_mamba_dropout':0.0,'eq_mamba_bidirectional':True,'eq_mamba_use_complex_conv':True,'full_phase_stem_freq_stride':2,'full_phase_stem_use_post_conv':False,'phase_head_upsample_mode':'bilinear','gre_fusion_scale':1.0,'use_complex_phase_refine_ffn':True,'pha_ffn_dropout':0.0,'pha_ffn_res_scale':1.0,'pha_ffn_expansion':4,'pha_ffn_use_complex_conv':True,'pha_ffn_kernel_size':3},'training_cfg':{'segment_size':32000},'stft_cfg':{'n_fft':510}}; m=MambaSEUNet(cfg); print(sum(p.numel() for p in m.parameters()))"
+
 在服务器终端执行：
 
 sudo apt update

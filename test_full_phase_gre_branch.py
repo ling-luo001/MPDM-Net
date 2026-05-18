@@ -154,6 +154,20 @@ def test_full_phase_branch_construction():
     assert isinstance(model.pha_complex_refinement[0], ComplexEqTMambaBlock)
 
 
+def test_no_middle_fusion_modules():
+    device = _get_device()
+    cfg = _get_cfg()
+    model = MambaSEUNet(cfg).to(device)
+
+    assert not hasattr(model, "mid_fusions")
+    assert not hasattr(model, "mid_in_proj_mag")
+    assert not hasattr(model, "mid_in_proj_pha")
+    assert not hasattr(model, "mid_fusion_proj_mag")
+    assert not hasattr(model, "mid_fusion_proj_pha")
+    assert hasattr(model, "gre_final_fusion")
+    assert hasattr(model, "complex_phase_head")
+
+
 def test_full_model_forward_smoke():
     device = _get_device()
     cfg = _get_cfg()
@@ -195,46 +209,3 @@ def test_phase_head_upsample_norm():
     norm = torch.sqrt(pred_cos ** 2 + pred_sin ** 2 + 1e-8)
     err = (norm - 1.0).abs().mean()
     assert err < 1e-3
-
-
-def test_full_phase_mid_fusion_alignment():
-    device = _get_device()
-    cfg = _get_cfg()
-    model = MambaSEUNet(cfg).to(device)
-    model.eval()
-
-    b = 1
-    f = cfg["stft_cfg"]["n_fft"] // 2 + 1
-    t = 64
-
-    noisy_mag = torch.rand(b, f, t, device=device)
-    noisy_pha = torch.randn(b, f, t, device=device)
-
-    mag_shapes = []
-    pha_shapes = []
-
-    def _mag_hook(_module, _inp, out):
-        mag_shapes.append(out.shape)
-
-    def _pha_hook(_module, _inp, out):
-        pha_shapes.append(out.shape)
-
-    hooks = []
-    for mod in model.mid_in_proj_mag:
-        hooks.append(mod.register_forward_hook(_mag_hook))
-    for mod in model.mid_in_proj_pha:
-        hooks.append(mod.register_forward_hook(_pha_hook))
-
-    with torch.no_grad():
-        model(noisy_mag, noisy_pha)
-
-    for h in hooks:
-        h.remove()
-
-    assert mag_shapes, "mag_in_fuse shapes not captured"
-    assert pha_shapes, "pha_in_fuse shapes not captured"
-    for mag_shape, pha_shape in zip(mag_shapes, pha_shapes):
-        assert mag_shape[-2:] == pha_shape[-2:], f"mid fusion mismatch: {mag_shape} vs {pha_shape}"
-        print(f"mid fusion spatial: mag_in_fuse={mag_shape}, pha_in_fuse={pha_shape}")
-
-

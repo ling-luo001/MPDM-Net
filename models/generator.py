@@ -22,7 +22,7 @@ from .mamba_block import (
     ComplexUpsample2D,
     ComplexConcatFuse2D,
 )
-from .cross import GREVSSMidFusion, GREVSSFinalFusion
+from .cross import GREVSSFinalFusion
 from .codec_module import DenseEncoder, MagDecoder
 import torch.nn.functional as F
 
@@ -415,9 +415,6 @@ class MambaSEUNet(nn.Module):
         mag_dim, pha_dim = self.mag_dim, self.pha_dim
         self.cross_pool_t = cfg['model_cfg'].get('cross_pool_t', 1)
         self.cross_pool_f = cfg['model_cfg'].get('cross_pool_f', 1)
-        # 独立控制中间层与最终层的交叉注意力下采样，middle 默认不下采样
-        self.cross_pool_t_mid = cfg['model_cfg'].get('cross_pool_t_mid', 1)
-        self.cross_pool_f_mid = cfg['model_cfg'].get('cross_pool_f_mid', 1)
         self.cross_pool_t_final = cfg['model_cfg'].get('cross_pool_t_final', self.cross_pool_t)
         self.cross_pool_f_final = cfg['model_cfg'].get('cross_pool_f_final', self.cross_pool_f)
 
@@ -525,43 +522,6 @@ class MambaSEUNet(nn.Module):
             eps=1e-8,
             upsample_mode=cfg['model_cfg'].get('phase_head_upsample_mode', 'bilinear'),
         )
-
-        # --- 5. 双流 VSS 融合模块 ---
-        # 1) 独立投影到高维 3H
-        self.mid_in_proj_mag = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(mag_dim[2], mag_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        self.mid_in_proj_pha = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(pha_dim[2], mag_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        # 2) VSS 交互（同维 3H）
-        self.mid_fusions = nn.ModuleList([
-            GREVSSMidFusion(
-                hidden_dim=mag_dim[2],
-                phase_channels=pha_dim[2],
-                cfg=cfg,
-                d_state=cfg['model_cfg'].get('d_state', 16),
-            ) for _ in range(self.num_mid_stages)
-        ])
-        # 3) 融合后还原各自宽度
-        self.mid_fusion_proj_mag = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(mag_dim[2] * 2, mag_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        self.mid_fusion_proj_pha = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(pha_dim[2] + mag_dim[2], pha_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=pha_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
         # --- 4. 最终解码器 ---
         self.mag_to_mask_proj = nn.Conv2d(mag_dim[0], mag_base, 1, 1, 0, bias=False)
         self.mask_decoder = MagDecoder(cfg)
@@ -600,19 +560,9 @@ class MambaSEUNet(nn.Module):
 
         mag_x3 = self.mag_down2_3(mag_x2)
         mag_x3 = self.mag_patch_embed_middle(mag_x3)
-        mag_fm_blocks = self.mag_FM_middle
-        mag_tm_blocks = self.mag_TM_middle
-
-        # ---------------------------
-        # Phase Tower Encoder (full complex GRE-safe)
-        # ---------------------------
-        stage_pairs = []
-        for idx in range(self.num_mid_stages):
-            pair_idx = idx // 2
-            if idx % 2 == 0:
-                stage_pairs.append((mag_fm_blocks[pair_idx], self.pha_TM_middle[pair_idx]))
-            else:
-                stage_pairs.append((mag_tm_blocks[pair_idx], self.pha_FM_middle[pair_idx]))
+        # Bottleneck without middle cross fusion.
+        # Magnitude and phase streams are modeled independently here.
+        # Cross-stream interaction is only performed at the final GREVSSFinalFusion.
 
         pha_r1, pha_i1 = self.pha_complex_stem(noisy_pha_4d)
         pha_copy1_r, pha_copy1_i = pha_r1, pha_i1
@@ -634,36 +584,14 @@ class MambaSEUNet(nn.Module):
 
         pha_r3, pha_i3 = self.pha_complex_down2_3(pha_r2, pha_i2)
         pha_r3, pha_i3 = self.pha_complex_patch_embed_middle(pha_r3, pha_i3)
-
-        for idx, (mag_block, pha_block) in enumerate(stage_pairs):
-            mag_res = mag_x3
-            pha_res_r, pha_res_i = pha_r3, pha_i3
-
-            mag_feat = mag_block(mag_x3)
-            pha_feat_r, pha_feat_i = pha_block(pha_r3, pha_i3)
-
-            pha_abs = torch.sqrt(pha_feat_r ** 2 + pha_feat_i ** 2 + 1e-8)
-            mag_in_fuse = self.mid_in_proj_mag[idx](mag_feat)
-            pha_in_fuse = self.mid_in_proj_pha[idx](pha_abs)
-            if mag_in_fuse.shape[-2:] != pha_in_fuse.shape[-2:]:
-                raise RuntimeError(
-                    f"mid fusion spatial mismatch: mag_in_fuse={mag_in_fuse.shape}, "
-                    f"pha_in_fuse={pha_in_fuse.shape}"
-                )
-
-            mag_fused, pha_r3, pha_i3 = self.mid_fusions[idx](
-                mag_in_fuse=mag_in_fuse,
-                pha_abs_in_fuse=pha_in_fuse,
-                mag_gate_feat=mag_feat,
-                pha_res_r=pha_res_r,
-                pha_res_i=pha_res_i,
-                pha_feat_r=pha_feat_r,
-                pha_feat_i=pha_feat_i,
-            )
-
-            mag_cat = torch.cat([mag_feat, mag_fused], dim=1)
-            mag_x3 = self.mid_fusion_proj_mag[idx](mag_cat)
-            mag_x3 = mag_x3 + mag_res
+        for idx in range(self.num_mid_stages):
+            pair_idx = idx // 2
+            if idx % 2 == 0:
+                mag_x3 = self.mag_FM_middle[pair_idx](mag_x3)
+                pha_r3, pha_i3 = self.pha_TM_middle[pair_idx](pha_r3, pha_i3)
+            else:
+                mag_x3 = self.mag_TM_middle[pair_idx](mag_x3)
+                pha_r3, pha_i3 = self.pha_FM_middle[pair_idx](pha_r3, pha_i3)
 
         # ---------------------------
         # Decoder Level2 (after upsample+concat -> mamba -> residual)
