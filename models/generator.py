@@ -1,5 +1,6 @@
 # Reference: https://github.com/huaidanquede/MUSE-Speech-Enhancement/tree/main/models/generator
 # cd /d G:\MPDM_Net\main_project && python -c "import torch; from models.mambairv2_assm import FASSMBlock; B,C,T,F=2,96,64,129; cfg={'model_cfg':{'d_state':16,'assm_num_tokens':32,'assm_inner_rank':64,'assm_mlp_ratio':2.0}}; block=FASSMBlock(cfg,C); x=torch.randn(B,C,T,F); y=block(x); print(x.shape, y.shape); assert y.shape==x.shape"
+# python -c "import torch; from models.mambairv2_assm import ASSM2DBlock; B,C,T,F=2,96,16,33; cfg={'model_cfg':{'d_state':16,'assm2d_num_tokens':32,'assm2d_inner_rank':64,'assm2d_mlp_ratio':2.0,'assm2d_res_scale_init':1e-2}}; block=ASSM2DBlock(cfg,C); x=torch.randn(B,C,T,F); y=block(x); print(x.shape, y.shape); assert y.shape==x.shape"
 import torch
 import torch.nn as nn
 import math
@@ -7,7 +8,7 @@ from torchvision.ops.deform_conv import DeformConv2d
 from einops import rearrange
 from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
-from .mambairv2_assm import FASSMBlock
+from .mambairv2_assm import FASSMBlock, ASSM2DBlock
 from .cross import VSSBlock_Cross_new
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
 import torch.nn.functional as F
@@ -204,8 +205,8 @@ class MambaSEUNet(nn.Module):
 
         # Bottleneck 中间层
         self.mag_patch_embed_middle = Patch_Embed_stage(mag_dim[2], mag_dim[2])
-        self.mag_FM_middle = nn.ModuleList([FASSMBlock(cfg, mag_dim[2]) for _ in range(self.num_mid_pairs)])
-        self.mag_TM_middle = nn.ModuleList([TMambaBlock(cfg, mag_dim[2]) for _ in range(self.num_mid_pairs)])
+        self.mag_FM_middle = nn.ModuleList([ASSM2DBlock(cfg, mag_dim[2]) for _ in range(self.num_mid_pairs)])
+        self.mag_TM_middle = nn.ModuleList([ASSM2DBlock(cfg, mag_dim[2]) for _ in range(self.num_mid_pairs)])
 
         # Decoder 路径
         self.mag_up3_2 = Upsample(mag_dim[2], mag_dim[1])
