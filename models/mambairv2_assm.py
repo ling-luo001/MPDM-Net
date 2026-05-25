@@ -330,6 +330,46 @@ class ASSM2DBlock(nn.Module):
         return out
 
 
+class TASSMBlock(nn.Module):
+    def __init__(self, cfg, inchannels):
+        super().__init__()
+        model_cfg = cfg.get("model_cfg", {})
+        d_state = model_cfg.get("d_state", 16)
+        num_tokens = model_cfg.get("tassm_num_tokens", model_cfg.get("assm_num_tokens", 32))
+        inner_rank = model_cfg.get("tassm_inner_rank", model_cfg.get("assm_inner_rank", 64))
+        mlp_ratio = model_cfg.get("tassm_mlp_ratio", model_cfg.get("assm_mlp_ratio", 2.0))
+        res_scale_init = model_cfg.get("tassm_res_scale_init", model_cfg.get("assm_res_scale_init", 1e-2))
+
+        self.hid_feature = inchannels
+        self.assm = ASSM(
+            dim=inchannels,
+            d_state=d_state,
+            input_resolution=(1, 1),
+            num_tokens=num_tokens,
+            inner_rank=inner_rank,
+            mlp_ratio=mlp_ratio,
+        )
+        self.token = nn.Embedding(inner_rank, d_state)
+        self.res_scale = nn.Parameter(torch.ones(1) * res_scale_init)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.dim() == 4
+        b, c, t, f = x.shape
+        assert c == self.hid_feature
+
+        residual = x
+        x_seq = x.permute(0, 3, 2, 1).contiguous().view(b * f, t, c)
+        y_seq = self.assm(x_seq, x_size=(t, 1), token=self.token)
+        y = y_seq.view(b, f, t, c).permute(0, 3, 2, 1).contiguous()
+
+        assert y.shape == residual.shape
+        if not torch.isfinite(y).all():
+            raise RuntimeError("TASSMBlock output contains NaN/Inf")
+
+        out = residual + y
+        return out
+
+
 class FASSMBlock(nn.Module):
     def __init__(self, cfg, inchannels):
         super().__init__()
@@ -365,7 +405,7 @@ class FASSMBlock(nn.Module):
         if not torch.isfinite(y).all():
             raise RuntimeError("FASSMBlock output contains NaN/Inf")
 
-        out = residual + self.res_scale * y
+        out = residual + y
         return out
 
 

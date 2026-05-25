@@ -8,7 +8,7 @@ from torchvision.ops.deform_conv import DeformConv2d
 from einops import rearrange
 from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
-from .mambairv2_assm import FASSMBlock, ASSM2DBlock
+from .mambairv2_assm import FASSMBlock, TASSMBlock, ASSM2DBlock
 from .cross import VSSBlock_Cross_new
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
 import torch.nn.functional as F
@@ -205,8 +205,8 @@ class MambaSEUNet(nn.Module):
 
         # Bottleneck 中间层
         self.mag_patch_embed_middle = Patch_Embed_stage(mag_dim[2], mag_dim[2])
-        self.mag_FM_middle = nn.ModuleList([ASSM2DBlock(cfg, mag_dim[2]) for _ in range(self.num_mid_pairs)])
-        self.mag_TM_middle = nn.ModuleList([ASSM2DBlock(cfg, mag_dim[2]) for _ in range(self.num_mid_pairs)])
+        self.mag_FM_middle = nn.ModuleList([FASSMBlock(cfg, mag_dim[2]) for _ in range(self.num_mid_pairs)])
+        self.mag_TM_middle = nn.ModuleList([TASSMBlock(cfg, mag_dim[2]) for _ in range(self.num_mid_pairs)])
 
         # Decoder 路径
         self.mag_up3_2 = Upsample(mag_dim[2], mag_dim[1])
