@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" serverName="lz@192.168.123.186:22 password" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="lz@192.168.123.186:22 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/media/lz/WZZ/psz/MPDM-Net" local="$PROJECT_DIR$" />
+          </mappings>
+          <excludedPaths>
+            <excludedPath path="/media/lz/WZZ/psz/MPDM-Net/exp" />
+          </excludedPaths>
+        </serverdata>
+      </paths>
+    </serverData>
+  </component>
+</project>
