@@ -325,7 +325,7 @@ class FASSMBlock(nn.Module):
         if not torch.isfinite(y).all():
             raise RuntimeError("FASSMBlock output contains NaN/Inf")
 
-        out = residual + self.res_scale * y
+        out = residual + y
         return out
 
 
