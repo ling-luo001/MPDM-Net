@@ -298,8 +298,6 @@ class ASSM2DBlock(nn.Module):
         num_tokens = model_cfg.get("assm2d_num_tokens", model_cfg.get("assm_num_tokens", 32))
         inner_rank = model_cfg.get("assm2d_inner_rank", model_cfg.get("assm_inner_rank", 64))
         mlp_ratio = model_cfg.get("assm2d_mlp_ratio", model_cfg.get("assm_mlp_ratio", 2.0))
-        res_scale_init = model_cfg.get("assm2d_res_scale_init", model_cfg.get("assm_res_scale_init", 1e-2))
-
         self.hid_feature = inchannels
         self.assm = ASSM(
             dim=inchannels,
@@ -310,7 +308,6 @@ class ASSM2DBlock(nn.Module):
             mlp_ratio=mlp_ratio,
         )
         self.token = nn.Embedding(inner_rank, d_state)
-        self.res_scale = nn.Parameter(torch.ones(1) * res_scale_init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
@@ -338,8 +335,6 @@ class TASSMBlock(nn.Module):
         num_tokens = model_cfg.get("tassm_num_tokens", model_cfg.get("assm_num_tokens", 32))
         inner_rank = model_cfg.get("tassm_inner_rank", model_cfg.get("assm_inner_rank", 64))
         mlp_ratio = model_cfg.get("tassm_mlp_ratio", model_cfg.get("assm_mlp_ratio", 2.0))
-        res_scale_init = model_cfg.get("tassm_res_scale_init", model_cfg.get("assm_res_scale_init", 1e-2))
-
         self.hid_feature = inchannels
         self.assm = ASSM(
             dim=inchannels,
@@ -350,7 +345,6 @@ class TASSMBlock(nn.Module):
             mlp_ratio=mlp_ratio,
         )
         self.token = nn.Embedding(inner_rank, d_state)
-        self.res_scale = nn.Parameter(torch.ones(1) * res_scale_init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
@@ -378,7 +372,6 @@ class FASSMBlock(nn.Module):
         num_tokens = model_cfg.get("assm_num_tokens", 32)
         inner_rank = model_cfg.get("assm_inner_rank", 64)
         mlp_ratio = model_cfg.get("assm_mlp_ratio", 2.0)
-
         self.hid_feature = inchannels
         self.assm = ASSM(
             dim=inchannels,
@@ -389,7 +382,6 @@ class FASSMBlock(nn.Module):
             mlp_ratio=mlp_ratio,
         )
         self.token = nn.Embedding(inner_rank, d_state)
-        self.res_scale = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
@@ -407,6 +399,53 @@ class FASSMBlock(nn.Module):
 
         out = residual + y
         return out
+
+
+class TFASSMBlock(nn.Module):
+    def __init__(self, cfg, inchannels):
+        super().__init__()
+        model_cfg = cfg.get("model_cfg", {})
+        d_state = model_cfg.get("d_state", 16)
+
+        t_num_tokens = model_cfg.get("tassm_num_tokens", model_cfg.get("assm_num_tokens", 32))
+        t_inner_rank = model_cfg.get("tassm_inner_rank", model_cfg.get("assm_inner_rank", 64))
+        t_mlp_ratio = model_cfg.get("tassm_mlp_ratio", model_cfg.get("assm_mlp_ratio", 2.0))
+
+        f_num_tokens = model_cfg.get("assm_num_tokens", 32)
+        f_inner_rank = model_cfg.get("assm_inner_rank", 64)
+        f_mlp_ratio = model_cfg.get("assm_mlp_ratio", 2.0)
+
+        self.hid_feature = inchannels
+        self.time_assm = ASSM(
+            dim=inchannels,
+            d_state=d_state,
+            input_resolution=(1, 1),
+            num_tokens=t_num_tokens,
+            inner_rank=t_inner_rank,
+            mlp_ratio=t_mlp_ratio,
+        )
+        self.time_token = nn.Embedding(t_inner_rank, d_state)
+
+        self.freq_assm = ASSM(
+            dim=inchannels,
+            d_state=d_state,
+            input_resolution=(1, 1),
+            num_tokens=f_num_tokens,
+            inner_rank=f_inner_rank,
+            mlp_ratio=f_mlp_ratio,
+        )
+        self.freq_token = nn.Embedding(f_inner_rank, d_state)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, t, f = x.size()
+        assert c == self.hid_feature
+
+        x = x.permute(0, 3, 2, 1).contiguous().view(b * f, t, c)
+        x = self.time_assm(x, x_size=(t, 1), token=self.time_token) + x
+        x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
+        x = self.freq_assm(x, x_size=(1, f), token=self.freq_token) + x
+        x = x.view(b, t, f, c).permute(0, 3, 1, 2)
+        return x
 
 
 if __name__ == "__main__":

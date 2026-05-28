@@ -8,7 +8,7 @@ from torchvision.ops.deform_conv import DeformConv2d
 from einops import rearrange
 from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
-from .mambairv2_assm import FASSMBlock, TASSMBlock, ASSM2DBlock
+from .mambairv2_assm import FASSMBlock, TASSMBlock, TFASSMBlock, ASSM2DBlock
 from .cross import VSSBlock_Cross_new
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
 import torch.nn.functional as F
@@ -196,11 +196,11 @@ class MambaSEUNet(nn.Module):
         self.mag_encoder = DenseEncoder(mag_cfg)
         # Encoder 路径
         self.mag_patch_embed_encoder_level1 = Patch_Embed_stage(mag_dim[0], mag_dim[0])
-        self.mag_TSMamba1_encoder = nn.ModuleList([TFMambaBlock(cfg, mag_dim[0]) for _ in range(self.num_tscblocks)])
+        self.mag_TSMamba1_encoder = nn.ModuleList([TFASSMBlock(cfg, mag_dim[0]) for _ in range(self.num_tscblocks)])
         self.mag_down1_2 = Downsample(mag_dim[0], mag_dim[1])
 
         self.mag_patch_embed_encoder_level2 = Patch_Embed_stage(mag_dim[1], mag_dim[1])
-        self.mag_TSMamba2_encoder = nn.ModuleList([TFMambaBlock(cfg, mag_dim[1]) for _ in range(self.num_tscblocks)])
+        self.mag_TSMamba2_encoder = nn.ModuleList([TFASSMBlock(cfg, mag_dim[1]) for _ in range(self.num_tscblocks)])
         self.mag_down2_3 = Downsample(mag_dim[1], mag_dim[2])
 
         # Bottleneck 中间层
@@ -212,48 +212,48 @@ class MambaSEUNet(nn.Module):
         self.mag_up3_2 = Upsample(mag_dim[2], mag_dim[1])
         self.mag_concat_level2 = nn.Sequential(nn.Conv2d(mag_dim[1] * 2, mag_dim[1], 1, 1, 0, bias=False))
         self.mag_patch_embed_decoder_level2 = Patch_Embed_stage(mag_dim[1], mag_dim[1])
-        self.mag_TSMamba2_decoder = nn.ModuleList([TFMambaBlock(cfg, mag_dim[1]) for _ in range(self.num_tscblocks)])
+        self.mag_TSMamba2_decoder = nn.ModuleList([TFASSMBlock(cfg, mag_dim[1]) for _ in range(self.num_tscblocks)])
 
         self.mag_up2_1 = Upsample(mag_dim[1], mag_dim[0])
         self.mag_concat_level1 = nn.Sequential(nn.Conv2d(mag_dim[0] * 2, mag_dim[0], 1, 1, 0, bias=False))
         self.mag_patch_embed_decoder_level1 = Patch_Embed_stage(mag_dim[0], mag_dim[0])
-        self.mag_TSMamba1_decoder = nn.ModuleList([TFMambaBlock(cfg, mag_dim[0]) for _ in range(self.num_tscblocks)])
+        self.mag_TSMamba1_decoder = nn.ModuleList([TFASSMBlock(cfg, mag_dim[0]) for _ in range(self.num_tscblocks)])
 
         # Refinement 细化层
         self.mag_patch_embed_refinement = Patch_Embed_stage(mag_dim[0], mag_dim[0])
-        self.mag_refinement = nn.ModuleList([TFMambaBlock(cfg, mag_dim[0]) for _ in range(self.num_tscblocks)])
+        self.mag_refinement = nn.ModuleList([TFASSMBlock(cfg, mag_dim[0]) for _ in range(self.num_tscblocks)])
         self.mag_output = nn.Sequential(nn.Conv2d(mag_dim[0], mag_dim[0], 3, 1, 1, bias=False))
 
         # --- 3. Phase Tower 模块定义 (时域建模) ---
         self.pha_encoder = DenseEncoder(pha_cfg)
         # Encoder 路径
         self.pha_patch_embed_encoder_level1 = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_TSMamba1_encoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
+        self.pha_TSMamba1_encoder = nn.ModuleList([TASSMBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
         self.pha_down1_2 = Downsample(pha_dim[0], pha_dim[1])
 
         self.pha_patch_embed_encoder_level2 = Patch_Embed_stage(pha_dim[1], pha_dim[1])
-        self.pha_TSMamba2_encoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
+        self.pha_TSMamba2_encoder = nn.ModuleList([TASSMBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
         self.pha_down2_3 = Downsample(pha_dim[1], pha_dim[2])
 
         # Bottleneck 中间层
         self.pha_patch_embed_middle = Patch_Embed_stage(pha_dim[2], pha_dim[2])
-        self.pha_TM_middle = nn.ModuleList([TMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
-        self.pha_FM_middle = nn.ModuleList([FMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
+        self.pha_TM_middle = nn.ModuleList([TASSMBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
+        self.pha_FM_middle = nn.ModuleList([FASSMBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
 
         # Decoder 路径
         self.pha_up3_2 = Upsample(pha_dim[2], pha_dim[1])
         self.pha_concat_level2 = nn.Sequential(nn.Conv2d(pha_dim[1] * 2, pha_dim[1], 1, 1, 0, bias=False))
         self.pha_patch_embed_decoder_level2 = Patch_Embed_stage(pha_dim[1], pha_dim[1])
-        self.pha_TSMamba2_decoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
+        self.pha_TSMamba2_decoder = nn.ModuleList([TASSMBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
 
         self.pha_up2_1 = Upsample(pha_dim[1], pha_dim[0])
         self.pha_concat_level1 = nn.Sequential(nn.Conv2d(pha_dim[0] * 2, pha_dim[0], 1, 1, 0, bias=False))
         self.pha_patch_embed_decoder_level1 = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_TSMamba1_decoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
+        self.pha_TSMamba1_decoder = nn.ModuleList([TASSMBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
 
         # Refinement 细化层
         self.pha_patch_embed_refinement = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_refinement = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
+        self.pha_refinement = nn.ModuleList([TASSMBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
         self.pha_output = nn.Sequential(nn.Conv2d(pha_dim[0], pha_dim[0], 3, 1, 1, bias=False))
 
         # --- 5. 双流 VSS 融合模块 ---
