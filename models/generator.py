@@ -313,9 +313,9 @@ class MambaSEUNet(nn.Module):
         noisy_cos_4d = torch.cos(noisy_pha_4d)
         noisy_sin_4d = torch.sin(noisy_pha_4d)
 
-        # 只收窄相位流：mag 塔保持原输入规模，pha 塔使用单位圆相位表示。
+        # 只收窄相位流：mag 塔保持原输入规模，pha 塔使用 noisy complex RI 表示。
         mag_in = torch.cat((noisy_mag_4d, noisy_pha_4d), dim=1)
-        pha_in = torch.cat((noisy_cos_4d, noisy_sin_4d), dim=1)
+        pha_in = torch.cat((noisy_mag_4d * noisy_cos_4d, noisy_mag_4d * noisy_sin_4d), dim=1)
 
         # ---------------------------
         # Magnitude Tower Encoder
@@ -343,7 +343,7 @@ class MambaSEUNet(nn.Module):
         mag_prev = mag_x3
 
         # ---------------------------
-        # Phase Tower Encoder (circular phase input)
+        # Phase Tower Encoder (complex RI input)
         # ---------------------------
         pha_x1 = self.pha_encoder(pha_in)
         pha_copy1 = pha_x1
