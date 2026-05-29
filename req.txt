@@ -1,87 +1,71 @@
-absl-py==2.3.1
-audioread==3.1.0
-certifi==2025.11.12
-cffi==2.0.0
-charset-normalizer==3.4.4
-cryptography==46.0.6
-decorator==5.2.1
-einops==0.8.1
-exceptiongroup==1.3.1
-filelock==3.20.0
-fsspec==2025.12.0
-google-auth==2.49.1
-google-auth-oauthlib==1.0.0
-grpcio==1.76.0
-hf-xet==1.2.0
-huggingface-hub==0.36.0
-idna==3.11
-iniconfig==2.3.0
-Jinja2==3.1.6
-joblib==1.4.2
-lazy_loader==0.4
-librosa==0.10.2.post1
-llvmlite==0.46.0
-mamba-ssm @ file:///home/lz/%E4%B8%8B%E8%BD%BD/mamba_ssm-1.2.2%2Bcu118torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl#sha256=bf29fa11cf62cdf54ed5d2d38139536f53027cab77ee74b3683fb38bffbab9b5
-Markdown==3.10
-markdown-it-py==4.0.0
-MarkupSafe==2.1.5
-mdurl==0.1.2
-mpmath==1.3.0
-msgpack==1.1.2
-networkx==3.4.2
-ninja==1.13.0
-numba==0.63.1
-numpy==1.24.3
-nvidia-cublas-cu11==11.11.3.6
-nvidia-cuda-cupti-cu11==11.8.87
-nvidia-cuda-nvrtc-cu11==11.8.89
-nvidia-cuda-runtime-cu11==11.8.89
-nvidia-cudnn-cu11==9.1.0.70
-nvidia-cufft-cu11==10.9.0.58
-nvidia-curand-cu11==10.3.0.86
-nvidia-cusolver-cu11==11.4.1.48
-nvidia-cusparse-cu11==11.7.5.86
-nvidia-nccl-cu11==2.20.5
-nvidia-nvtx-cu11==11.8.86
-oauthlib==3.3.1
-packaging==25.0
-pesq==0.0.4
-pillow==12.0.0
-platformdirs==4.5.1
-pluggy==1.6.0
-pooch==1.8.2
-protobuf==3.20.3
-pyasn1==0.6.3
-pyasn1_modules==0.4.2
-pycparser==2.23
-Pygments==2.19.2
-pystoi==0.4.1
-pytest==9.0.3
-PyYAML==6.0.1
-regex==2025.11.3
-requests==2.32.5
-requests-oauthlib==2.0.0
-rich==14.2.0
-safetensors==0.7.0
-scikit-learn==1.7.2
-scipy==1.14.0
-six==1.17.0
-soundfile==0.13.1
-soxr==1.0.0
-sympy==1.14.0
-tensorboard==2.14.0
-tensorboard-data-server==0.7.2
-thop==0.1.1.post2209072238
-threadpoolctl==3.6.0
-timm==1.0.22
-tokenizers==0.22.1
-tomli==2.4.1
-torch==2.4.0+cu118
-torchaudio==2.4.0+cu118
-torchvision==0.19.0+cu118
-tqdm==4.67.1
-transformers==4.57.3
-triton==3.0.0
-typing_extensions==4.15.0
-urllib3==2.6.2
-Werkzeug==3.1.4
+我完整读了一遍当前网络。它本质上是一个 MP-SENet 思路 + Mamba/ASSM 双塔 + VSS 交互融合 的语音增强模型：输入 noisy magnitude/phase，幅度塔偏 TF/频域建模，相位塔偏时间建模，中间和末端做 mag/phase 交互，最后输出 magnitude mask 和 phase rotation，再用 iSTFT 回到波形。这个方向是对的，和 MP-SENet、SEMamba、MambaIRv2/ASSM 的思路都能对上，但我觉得现在最有实验价值的优化点不是继续盲目堆深度，而是把“相位几何、交互稳定性、目标函数、泛化数据”这几件事做扎实。
+最值得做的优化建议
+把相位流从 raw phase 改成圆周几何建模
+现在模型输入和相位塔内部大量使用 noisy_pha 这个裸角度值，见 generator.py 的输入拼接逻辑大约在 forward 前段。裸相位在 -pi/pi 处不连续，卷积、归一化、Mamba/ASSM 都会把它当欧氏空间处理，这会伤害相位学习。2026 年的 GRE phase modeling 明确指出相位的圆周拓扑是关键，并通过 rotation equivariance 提升相位距离和泛化 PESQ。
+建议实验：
+输入从 [mag, pha] 改成 [mag, cos(pha), sin(pha)]，或直接 [real, imag, mag]。
+相位塔内部不再预测裸相位，而是全程预测单位复数旋转 delta_cos/delta_sin，你现在末端已经这么做了，可以把这个思想前移。
+加一个 global phase rotation augmentation：训练时随机给 noisy/clean phase 同时加常数旋转，看模型是否保持等变。
+相位 loss 增加 1 - cos(clean_pha - pred_pha)，比纯 anti-wrapping 更稳定。
+
+给中间 VSS 交互和 global fusion 加残差门控/LayerScale
+当前中间层每次 mag_feat/pha_feat -> VSSBlock_Cross_new -> concat -> proj -> residual，末端还有一次 global fusion。这个结构表达力强，但也是最可能导致 NaN 和训练震荡的地方，配置注释里已经记录过 pha_fused contains NaN/Inf。建议给每个 fusion 输出加可学习缩放，初始化为 0 或 1e-3，让模型从“几乎不交互”逐渐学会交互。
+实验形式：
+python
+
+
+
+self.fusion_scale = nn.Parameter(torch.zeros(1))
+x = residual + self.fusion_scale * fused
+
+这类 LayerScale/zero-init residual 在深层视觉和语音模型里很常见，对你这种多分支交互结构尤其有价值。优先改中间 mid_fusions 和 global_fusion，预期收益是更少 NaN、更稳定的 PESQ/STOI 曲线。
+
+做一个 Mamba + 局部注意力的混合 bottleneck，而不是纯 ASSM/VSS
+Mamba 的优势是长序列线性建模，但它对精细的局部 T-F 对齐、谐波结构和瞬态噪声未必比注意力强。Conformer 的核心经验是“卷积负责局部，注意力负责全局”；TF-GridNet 强调 full-band/sub-band 结合；近年的 Mamba speech enhancement 也开始走 Mamba-attention hybrid。你的 bottleneck 分辨率已经较低，是插入轻量局部注意力最划算的位置。
+建议实验：
+在 mag_x3/pha_x3 中间层，每 2 个 ASSM/VSS 后插入一个 windowed TF attention。
+attention 只放 bottleneck，窗口比如 T x F = 8x16 或频带分组 attention。
+和当前纯 VSS middle 做 A/B：参数/FLOPs 控制接近，比较 PESQ、STOI、SI-SDR、边界伪影。
+
+把 magnitude mask 分支升级成 “mask + complex residual” 双目标
+现在幅度输出是 mag_mask * noisy_mag，并被 LearnableSigmoid 限在 0 ~ beta。这继承了 MP-SENet 的优点，但也限制了模型：真实增强有时需要复杂的 RI 修正，而不仅是幅度缩放。D2Former、complex spectral mapping、TF-GridNet 这类强模型都说明 complex-domain target 很有价值。
+建议新增一个轻量 RI residual head：
+保留当前 mag_mask。
+增加 res_real/res_imag 或 complex ratio mask。
+最终输出：
+enhanced_complex = mask_complex * noisy_complex + residual_complex
+再从 enhanced complex 反推 mag/phase。
+这会让模型同时具备 MP-SENet 的稳定 mask 能力和 complex mapping 的精细相位/幅度修正能力。
+
+重构损失：加入 multi-resolution STFT + SI-SDR，弱化单一 PESQ discriminator
+现在 loss 包括 magnitude、phase、complex、time L1、consistency、metric discriminator，方向正确，但有两个问题：PESQ batch 计算很慢且不稳定，discriminator 只看 magnitude；单一 STFT 配置也容易过拟合某个分析窗。
+建议实验：
+增加 multi-resolution STFT loss：n_fft = 256/512/1024，包含 spectral convergence + log magnitude。
+加 SI-SDR 或 scale-invariant waveform loss。
+Metric discriminator 输入从 (clean_mag, pred_mag) 扩展到 complex 或 waveform embedding。
+训练策略改成前 5k-10k steps 不开 metric loss，后面再逐步升权重。
+
+认真处理 PCS400：更适合作为后处理/辅助目标，而不是直接替换 clean target
+SEMamba 报告 PCS 对 PESQ 很有效，尤其 VoiceBank-DEMAND 上 PESQ 提升明显。但你当前 use_PCS400=True 时是在 dataloader 里把 clean_audio 替换成 PCS 后的 clean，这会改变监督目标，可能让模型学到“迎合 PESQ 的谱形状”，但牺牲真实保真度和泛化。
+建议：
+主模型仍监督原始 clean。
+额外加一个 PCS teacher loss：loss_pcs = STFT(pred, PCS(clean))，小权重。
+或者只在 inference/post-processing 开 PCS。
+比较三组：无 PCS、PCS target、PCS auxiliary/post-processing。
+
+数据泛化比继续加模块更可能带来真实收益
+目前训练看起来主要是 VCTK+DEMAND JSON 随机切片。USEMamba 在 universal SE 中强调多失真、多语言、多采样率泛化；这对模型效果提升很现实。建议构建动态增强：
+动态 SNR：-5, 0, 5, 10, 15, 20 dB。
+随机 RIR 混响、带宽限制、codec、clipping、packet loss。
+训练前期简单噪声，后期混合复杂失真，做 curriculum。
+验证集固定分 in-domain 和 out-of-domain，避免只优化 VoiceBank PESQ。
+
+推理分段建议改成 overlap-add
+当前 inference/validation 是硬切 segment，再拼接，边界容易有相位和能量不连续。建议 50% overlap + Hann crossfade，或者至少在 segment 两端留 context 后裁中间。这类改动不影响训练，却可能直接减少听感伪影。
+
+我建议的实验优先级
+第一优先级：相位 sin/cos 输入 + fusion LayerScale + multi-res STFT loss。
+第二优先级：bottleneck 加轻量局部 attention，做 Mamba-attention hybrid。
+第三优先级：complex residual head + PCS 辅助目标 + overlap-add inference。
+第四优先级：动态数据增强和跨数据集验证。
+参考依据：MP-SENet 明确支持幅度/相位并行、多级谱损失和 metric discriminator；SEMamba 证明 Mamba 在语音增强有效且 PCS 可提升 PESQ；Mamba/Mamba-2 支持长序列高效建模；MambaIRv2 的 ASSM 提供了语义邻域排序和 prompt 式 state-space 建模；GRE phase modeling 则非常契合你当前相位塔的短板。可参考：MP-SENet、SEMamba、Mamba、Mamba-2、MambaIRv2、GRE phase modeling、TF-GridNet、MetricGAN+。
