@@ -310,10 +310,12 @@ class MambaSEUNet(nn.Module):
         # [B, F, T] -> [B, 1, T, F]
         noisy_mag_4d = rearrange(noisy_mag, 'b f t -> b t f').unsqueeze(1)
         noisy_pha_4d = rearrange(noisy_pha, 'b f t -> b t f').unsqueeze(1)
+        noisy_cos_4d = torch.cos(noisy_pha_4d)
+        noisy_sin_4d = torch.sin(noisy_pha_4d)
 
-        # 双塔均使用原始 cat 输入
+        # 只收窄相位流：mag 塔保持原输入规模，pha 塔使用单位圆相位表示。
         mag_in = torch.cat((noisy_mag_4d, noisy_pha_4d), dim=1)
-        pha_in = torch.cat((noisy_mag_4d, noisy_pha_4d), dim=1)
+        pha_in = torch.cat((noisy_cos_4d, noisy_sin_4d), dim=1)
 
         # ---------------------------
         # Magnitude Tower Encoder
@@ -341,7 +343,7 @@ class MambaSEUNet(nn.Module):
         mag_prev = mag_x3
 
         # ---------------------------
-        # Phase Tower Encoder (RI input)
+        # Phase Tower Encoder (circular phase input)
         # ---------------------------
         pha_x1 = self.pha_encoder(pha_in)
         pha_copy1 = pha_x1
@@ -464,7 +466,7 @@ class MambaSEUNet(nn.Module):
             raise RuntimeError('mag_mask contains NaN/Inf')
         denoised_mag = rearrange(mag_mask * noisy_mag_4d, 'b c t f -> b f t c').squeeze(-1)
 
-        # Phase residual (tanh*pi) then add to noisy_pha
+        # Predict a unit complex rotation and apply it on the noisy phase unit vector.
         if not torch.isfinite(denoised_mag).all():
             raise RuntimeError('denoised_mag contains NaN/Inf')
         rot_vec = self.phase_decoder(pha_fused)
@@ -473,9 +475,8 @@ class MambaSEUNet(nn.Module):
         delta_cos = delta_cos.squeeze(1)  # [B, T, F]
         delta_sin = delta_sin.squeeze(1)
 
-        # 直接基于 noisy_pha 计算 sin/cos
-        noisy_cos = torch.cos(noisy_pha_4d).squeeze(1)  # [B, T, F]
-        noisy_sin = torch.sin(noisy_pha_4d).squeeze(1)  # [B, T, F]
+        noisy_cos = noisy_cos_4d.squeeze(1)  # [B, T, F]
+        noisy_sin = noisy_sin_4d.squeeze(1)  # [B, T, F]
 
         pred_cos = noisy_cos * delta_cos - noisy_sin * delta_sin
         pred_sin = noisy_sin * delta_cos + noisy_cos * delta_sin

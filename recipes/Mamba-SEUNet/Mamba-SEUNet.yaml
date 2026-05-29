@@ -1,102 +1,16 @@
-## Environment Settings
-#(base) lz@lz-System-Product-Name:/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM$ conda activate mamba
-#(mamba) lz@lz-System-Product-Name:/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM$ python train.py
-#
-#[rank0]:   File "/home/lz/anaconda3/envs/mamba/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
-#[rank0]:     return forward_call(*args, **kwargs)
-#[rank0]:   File "/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM/models/generator.py", line 412, in forward
-#[rank0]:     raise RuntimeError('pha_fused contains NaN/Inf')
-#[rank0]: RuntimeError: pha_fused contains NaN/Inf
 
-
-#class FFCM(nn.Module):
-#    def __init__(
-#            self,
-#            dim,
-#            token_mixer_for_gloal=Freq_Fusion,
-#            mixer_kernel_size=[1,3,5,7],
-#            local_size=8
-#    ):
-#        super(FFCM, self).__init__()
-#        self.dim = dim
-#        self.mixer_gloal = token_mixer_for_gloal(dim=self.dim, kernel_size=mixer_kernel_size,
-#                                 se_ratio=8, local_size=local_size)
-#
-#        # 修改：在卷积后添加 BatchNorm2d
-#        self.ca_conv = nn.Sequential(
-#            nn.Conv2d(2*dim, dim, 1),
-#            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, padding_mode='reflect'),
-#            nn.BatchNorm2d(dim),  # Added Norm: 防止数值过大
-#            nn.GELU()
-#        )
-#
-#        self.ca = nn.Sequential(
-#            nn.AdaptiveAvgPool2d(1),
-#            nn.Conv2d(dim, dim // 4, kernel_size=1),
-#            nn.GELU(),
-#            nn.Conv2d(dim // 4, dim, kernel_size=1),
-#            nn.Sigmoid()
-#        )
-#
-#        # 修改：在卷积后添加 BatchNorm2d
-#        self.conv_init = nn.Sequential(  # PW->DW->
-#            nn.Conv2d(dim, dim * 2, 1),
-#            nn.BatchNorm2d(dim * 2),  # Added Norm: 稳定初始特征分布
-#            nn.GELU()
-#        )
-#
-#        # 修改：在卷积后添加 BatchNorm2d
-#        self.dw_conv_1 = nn.Sequential(
-#            nn.Conv2d(self.dim, self.dim, kernel_size=3, padding=3 // 2,
-#                      groups=self.dim, padding_mode='reflect'),
-#            nn.BatchNorm2d(self.dim),  # Added Norm
-#            nn.GELU()
-#        )
-#
-#        # 修改：在卷积后添加 BatchNorm2d
-#        self.dw_conv_2 = nn.Sequential(
-#            nn.Conv2d(self.dim, self.dim, kernel_size=5, padding=5 // 2,
-#                      groups=self.dim, padding_mode='reflect'),
-#            nn.BatchNorm2d(self.dim),  # Added Norm
-#            nn.GELU()
-#        )
-#
-#    def forward(self, x):
-#        shortcut = x  # 保存输入用于残差连接
-#
-#        x = self.conv_init(x)
-#        x = list(torch.split(x, self.dim, dim=1))
-#
-#        x_local_1 = self.dw_conv_1(x[0])
-#        # 保持之前的修复：使用 x[1] 确保特征充分利用
-#        x_local_2 = self.dw_conv_2(x[1])
-#
-#        x_gloal = self.mixer_gloal(torch.cat([x_local_1, x_local_2], dim=1))
-#        x = self.ca_conv(x_gloal)
-#        x = self.ca(x) * x
-#
-#        return x + shortcut  # 保持残差连接
-#
-
-
-#Generator Parameters : 1896071
-#checkpoints directory : exp/Mamba_emb_basis_16_2_dual_tower_interaction_fuseMamba
-#Epoch: 1
-#[rank0]: Traceback (most recent call last):
-#[rank0]:   File "/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM/train.py", line 485, in <module>
-#[rank0]:     main()
-#[rank0]:   File "/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM/train.py", line 482, in main
-#[rank0]:     train(0, args, cfg)
-#[rank0]:   File "/media/lz/WZZ/psz/mamba-dual-tower/Mamba-SEUNet-main_3TSFM/train.py", line 202, in train
-#[rank0]:     clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
-#[rank0]: ValueError: too many values to unpack (expected 6)
-
-# These settings specify the hardware and distributed setup for the model training.
-# Adjust `num_gpus` and `dist_config` according to your distributed training environment.
-#1896088  8176M
+#我完整读了一遍当前网络。它本质上是一个 MP-SENet 思路 + Mamba/ASSM 双塔 + VSS 交互融合 的语音增强模型：输入 noisy magnitude/phase，幅度塔偏 TF/频域建模，相位塔偏时间建模，中间和末端做 mag/phase 交互，最后输出 magnitude mask 和 phase rotation，再用 iSTFT 回到波形。这个方向是对的，和 MP-SENet、SEMamba、MambaIRv2/ASSM 的思路都能对上，但我觉得现在最有实验价值的优化点不是继续盲目堆深度，而是把“相位几何、交互稳定性、目标函数、泛化数据”这几件事做扎实。
+#最值得做的优化建议
+#把相位流从 raw phase 改成圆周几何建模
+#现在模型输入和相位塔内部大量使用 noisy_pha 这个裸角度值，见 generator.py 的输入拼接逻辑大约在 forward 前段。裸相位在 -pi/pi 处不连续，卷积、归一化、Mamba/ASSM 都会把它当欧氏空间处理，这会伤害相位学习。2026 年的 GRE phase modeling 明确指出相位的圆周拓扑是关键，并通过 rotation equivariance 提升相位距离和泛化 PESQ。
+#建议实验：
+#输入从 [mag, pha] 改成 [mag, cos(pha), sin(pha)]，或直接 [real, imag, mag]。
+#相位塔内部不再预测裸相位，而是全程预测单位复数旋转 delta_cos/delta_sin，你现在末端已经这么做了，可以把这个思想前移。
+#加一个 global phase rotation augmentation：训练时随机给 noisy/clean phase 同时加常数旋转，看模型是否保持等变。
+#相位 loss 增加 1 - cos(clean_pha - pred_pha)，比纯 anti-wrapping 更稳定。
 env_setting:
   num_gpus: 1  # Number of GPUs. Now we don't support CPU mode.
-  num_workers: 12  # Number of worker threads for data loading.
+  num_workers: 8  # Number of worker threads for data loading.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
   stdout_interval: 200
   checkpoint_interval: 2000  # save model to ckpt every N steps
