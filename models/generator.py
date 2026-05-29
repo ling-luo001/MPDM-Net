@@ -300,6 +300,26 @@ class MambaSEUNet(nn.Module):
         pha_dec_cfg = deepcopy(cfg)
         pha_dec_cfg['model_cfg']['hid_feature'] = pha_base
         self.phase_decoder = PhaseDecoder(pha_dec_cfg)
+        self.phase_eps = cfg['model_cfg'].get('phase_eps', 1e-3)
+        self.complex_residual_scale = cfg['model_cfg'].get('complex_residual_scale', 0.1)
+        self.complex_residual_decoder = nn.Sequential(
+            nn.Conv2d(pha_dim[0], pha_dim[0] * 4, 1, 1, 0, bias=False),
+            nn.PixelShuffle(2),
+            nn.Conv2d(
+                pha_dim[0],
+                pha_dim[0],
+                kernel_size=(1, 3),
+                stride=(2, 1),
+                padding=(0, 1),
+                groups=pha_dim[0],
+                bias=False
+            ),
+            nn.InstanceNorm2d(pha_dim[0], affine=True),
+            nn.PReLU(pha_dim[0]),
+            nn.Conv2d(pha_dim[0], cfg['model_cfg']['output_channel'] * 2, (1, 1))
+        )
+        nn.init.zeros_(self.complex_residual_decoder[-1].weight)
+        nn.init.zeros_(self.complex_residual_decoder[-1].bias)
 
     def forward(self, noisy_mag, noisy_pha):
         if not torch.isfinite(noisy_mag).all():
@@ -310,8 +330,7 @@ class MambaSEUNet(nn.Module):
         # [B, F, T] -> [B, 1, T, F]
         noisy_mag_4d = rearrange(noisy_mag, 'b f t -> b t f').unsqueeze(1)
         noisy_pha_4d = rearrange(noisy_pha, 'b f t -> b t f').unsqueeze(1)
-
-        # 双塔均使用原始 cat 输入
+        # 双塔均使用原始 cat 输入；本分支只在最终高层特征处学习复数残差。
         mag_in = torch.cat((noisy_mag_4d, noisy_pha_4d), dim=1)
         pha_in = torch.cat((noisy_mag_4d, noisy_pha_4d), dim=1)
 
@@ -341,7 +360,7 @@ class MambaSEUNet(nn.Module):
         mag_prev = mag_x3
 
         # ---------------------------
-        # Phase Tower Encoder (RI input)
+        # Phase Tower Encoder
         # ---------------------------
         pha_x1 = self.pha_encoder(pha_in)
         pha_copy1 = pha_x1
@@ -464,7 +483,7 @@ class MambaSEUNet(nn.Module):
             raise RuntimeError('mag_mask contains NaN/Inf')
         denoised_mag = rearrange(mag_mask * noisy_mag_4d, 'b c t f -> b f t c').squeeze(-1)
 
-        # Phase residual (tanh*pi) then add to noisy_pha
+        # Predict a unit complex rotation and apply it on the noisy phase unit vector.
         if not torch.isfinite(denoised_mag).all():
             raise RuntimeError('denoised_mag contains NaN/Inf')
         rot_vec = self.phase_decoder(pha_fused)
@@ -473,7 +492,6 @@ class MambaSEUNet(nn.Module):
         delta_cos = delta_cos.squeeze(1)  # [B, T, F]
         delta_sin = delta_sin.squeeze(1)
 
-        # 直接基于 noisy_pha 计算 sin/cos
         noisy_cos = torch.cos(noisy_pha_4d).squeeze(1)  # [B, T, F]
         noisy_sin = torch.sin(noisy_pha_4d).squeeze(1)  # [B, T, F]
 
@@ -484,13 +502,31 @@ class MambaSEUNet(nn.Module):
         pred_cos = rearrange(pred_cos, 'b t f -> b f t')
         pred_sin = rearrange(pred_sin, 'b t f -> b f t')
 
-        pred_pha = torch.atan2(pred_sin, pred_cos)
+        base_real = denoised_mag * pred_cos
+        base_imag = denoised_mag * pred_sin
+
+        complex_residual = torch.tanh(self.complex_residual_decoder(pha_fused))
+        if not torch.isfinite(complex_residual).all():
+            raise RuntimeError('complex_residual contains NaN/Inf')
+        res_real, res_imag = torch.chunk(complex_residual, 2, dim=1)
+        residual_scale = self.complex_residual_scale * noisy_mag_4d.squeeze(1)
+        res_real = rearrange(res_real.squeeze(1) * residual_scale, 'b t f -> b f t')
+        res_imag = rearrange(res_imag.squeeze(1) * residual_scale, 'b t f -> b f t')
+
+        enh_real = base_real + res_real
+        enh_imag = base_imag + res_imag
+        denoised_mag = torch.sqrt(torch.clamp(enh_real ** 2 + enh_imag ** 2, min=1e-12))
+        if not torch.isfinite(denoised_mag).all():
+            raise RuntimeError('denoised_mag contains NaN/Inf')
+        phase_floor = torch.full_like(enh_real, self.phase_eps)
+        phase_real = torch.where(denoised_mag.detach() < self.phase_eps, phase_floor, enh_real)
+        pred_pha = torch.atan2(enh_imag, phase_real)
         if not torch.isfinite(pred_pha).all():
             raise RuntimeError('pred_pha contains NaN/Inf')
 
         denoised_com = torch.stack(
-            (denoised_mag * pred_cos,
-             denoised_mag * pred_sin),
+            (enh_real,
+             enh_imag),
             dim=-1
         )
         if not torch.isfinite(denoised_com).all():

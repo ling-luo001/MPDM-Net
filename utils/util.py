@@ -34,7 +34,7 @@ def initialize_process_group(cfg, rank):
 
 def log_model_info(rank, model, exp_path):
     """Log model information and create necessary directories."""
-    print(model)
+    # print(model)
     num_params = sum(p.numel() for p in model.parameters())
     print("Generator Parameters :", num_params)
     os.makedirs(exp_path, exist_ok=True)
