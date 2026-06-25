@@ -1,4 +1,16 @@
 # Change Summary
+  最高测试 PESQ 是：
+
+  PESQ = 3.465935945511
+  step = 366000
+  tag  = Validation/PESQ Score
+
+• 原程序这个日志目录里的最高测试 PESQ 是：
+
+  PESQ = 3.471664667130
+  step = 584000
+  tag  = Validation/PESQ Score
+
 
 This branch keeps the original dual-tower input design. Both the magnitude tower
 and phase tower still receive the raw `(noisy_mag, noisy_pha)` input pair.
