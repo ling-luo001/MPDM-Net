@@ -57,6 +57,38 @@ def get_model_attr(model, attr_name, default=None):
     return getattr(model_ref, attr_name, default)
 
 
+def unwrap_model(model):
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def clone_state_dict(model):
+    return {
+        key: value.detach().clone()
+        for key, value in unwrap_model(model).state_dict().items()
+    }
+
+
+def cpu_state_dict(state_dict):
+    return {
+        key: value.detach().cpu()
+        for key, value in state_dict.items()
+    }
+
+
+def update_ema_state(ema_state, model, decay):
+    model_state = unwrap_model(model).state_dict()
+    with torch.no_grad():
+        for key, value in model_state.items():
+            if not torch.is_floating_point(value):
+                ema_state[key].copy_(value)
+            else:
+                ema_state[key].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
+
+
+def load_state_dict_to_model(model, state_dict):
+    unwrap_model(model).load_state_dict(state_dict, strict=False)
+
+
 def complex_residual_regularization(generator):
     aux = get_model_attr(generator, 'latest_aux', {})
     applied_residual = aux.get('complex_residual_applied')
@@ -193,6 +225,9 @@ def train(rank, args, cfg):
     max_grad_norm = cfg['training_cfg'].get('max_grad_norm', 5.0)
     use_phase_weight = cfg['training_cfg'].get('phase_weighted_loss', False)
     residual_reg_weight = cfg['training_cfg']['loss'].get('complex_residual_reg', 0.0)
+    use_ema = cfg['training_cfg'].get('use_ema', False)
+    ema_decay = cfg['training_cfg'].get('ema_decay', 0.999)
+    ema_state = clone_state_dict(generator) if use_ema else None
 
     # Create trainset and train_loader
     trainset = create_dataset(cfg, train=True, split=True, device=device)
@@ -301,6 +336,8 @@ def train(rank, args, cfg):
                     error_if_nonfinite=True
                 )
             optim_g.step()
+            if ema_state is not None:
+                update_ema_state(ema_state, generator, ema_decay)
             # ------------------------------------------------------- #
 
             if rank == 0:
@@ -331,14 +368,25 @@ def train(rank, args, cfg):
                     save_checkpoint(
                         exp_name,
                         {
-                            'generator': (generator.module if num_gpus > 1 else generator).state_dict()
+                            'generator': unwrap_model(generator).state_dict()
                         }
                     )
+                    if ema_state is not None:
+                        exp_name = f"{args.exp_path}/ema_g_{steps:08d}.pth"
+                        save_checkpoint(
+                            exp_name,
+                            {
+                                'generator': cpu_state_dict(ema_state),
+                                'steps': steps,
+                                'epoch': epoch,
+                                'ema_decay': ema_decay
+                            }
+                        )
                     exp_name = f"{args.exp_path}/do_{steps:08d}.pth"
                     save_checkpoint(
                         exp_name,
                         {
-                            'discriminator': (discriminator.module if num_gpus > 1 else discriminator).state_dict(),
+                            'discriminator': unwrap_model(discriminator).state_dict(),
                             'optim_g': optim_g.state_dict(),
                             'optim_d': optim_d.state_dict(),
                             'steps': steps,
@@ -365,6 +413,10 @@ def train(rank, args, cfg):
                 # Validation
                 if steps % cfg['env_setting']['validation_interval'] == 0 and steps != 0:
                     generator.eval()
+                    raw_generator_state = None
+                    if ema_state is not None:
+                        raw_generator_state = clone_state_dict(generator)
+                        load_state_dict_to_model(generator, ema_state)
                     torch.cuda.empty_cache()
                     audios_r, audios_g = [], []
                     val_mag_err_tot = 0
@@ -469,12 +521,25 @@ def train(rank, args, cfg):
                         sw.add_scalar("Validation/Phase Loss", val_pha_err, steps)
                         sw.add_scalar("Validation/Complex Loss", val_com_err, steps)
 
+                    if raw_generator_state is not None:
+                        load_state_dict_to_model(generator, raw_generator_state)
                     generator.train()
 
                     # Print best validation PESQ score in terminal
                     if val_pesq_score >= best_pesq:
                         best_pesq = val_pesq_score
                         best_pesq_step = steps
+                        save_checkpoint(
+                            f"{args.exp_path}/best_g.pth",
+                            {
+                                'generator': cpu_state_dict(ema_state) if ema_state is not None else cpu_state_dict(clone_state_dict(generator)),
+                                'steps': steps,
+                                'epoch': epoch,
+                                'pesq': best_pesq,
+                                'ema': ema_state is not None,
+                                'ema_decay': ema_decay if ema_state is not None else None
+                            }
+                        )
                     print(f"valid: PESQ {val_pesq_score}, Mag_loss {val_mag_err}, Phase_loss {val_pha_err}. Best_PESQ: {best_pesq} at step {best_pesq_step}")
 
             steps += 1

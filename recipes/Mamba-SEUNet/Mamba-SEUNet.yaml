@@ -133,6 +133,8 @@ training_cfg:
   phase_weighted_loss: true  # Weight phase loss toward high-energy speech-dominant bins.
   phase_weight_power: 0.5
   phase_weight_floor: 0.1
+  use_ema: true
+  ema_decay: 0.999
   lr_decay: 0.99  # Learning rate decay per epoch.
   segment_size: 30600  # Audio segment size used during training, dependent on sampling rate.
   loss:
