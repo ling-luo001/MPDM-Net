@@ -5,7 +5,30 @@ import numpy as np
 from pesq import pesq
 from joblib import Parallel, delayed
 
-def phase_losses(phase_r, phase_g, cfg):
+def _phase_weight(mag_weight, target, cfg):
+    eps = torch.finfo(target.dtype).eps
+    weight = mag_weight.detach().to(device=target.device, dtype=target.dtype)
+    while weight.dim() > target.dim():
+        weight = weight.squeeze(1)
+    if weight.shape != target.shape:
+        weight = weight.reshape_as(target)
+
+    floor = cfg['training_cfg'].get('phase_weight_floor', 0.1)
+    power = cfg['training_cfg'].get('phase_weight_power', 0.5)
+    max_per_sample = torch.clamp(weight.amax(dim=(-2, -1), keepdim=True), min=eps)
+    weight = torch.clamp(weight / max_per_sample, min=0.0, max=1.0)
+    weight = torch.pow(weight, power)
+    weight = torch.clamp(weight, min=floor)
+    return weight / torch.clamp(weight.mean(dim=(-2, -1), keepdim=True), min=eps)
+
+
+def _weighted_mean(error, weight):
+    if weight is None:
+        return torch.mean(error)
+    return torch.mean(error * weight)
+
+
+def phase_losses(phase_r, phase_g, cfg, mag_weight=None):
     """
     Calculate phase losses including in-phase loss, gradient delay loss, 
     and integrated absolute frequency loss between reference and generated phases.
@@ -39,10 +62,18 @@ def phase_losses(phase_r, phase_g, cfg):
     iaf_r = torch.matmul(phase_r, iaf_matrix)
     iaf_g = torch.matmul(phase_g, iaf_matrix)
     
+    ip_weight = None
+    gd_weight = None
+    iaf_weight = None
+    if mag_weight is not None:
+        ip_weight = _phase_weight(mag_weight, phase_r, cfg)
+        gd_weight = ip_weight.permute(0, 2, 1)
+        iaf_weight = ip_weight
+
     # Calculate losses
-    ip_loss = torch.mean(anti_wrapping_function(phase_r - phase_g))
-    gd_loss = torch.mean(anti_wrapping_function(gd_r - gd_g))
-    iaf_loss = torch.mean(anti_wrapping_function(iaf_r - iaf_g))
+    ip_loss = _weighted_mean(anti_wrapping_function(phase_r - phase_g), ip_weight)
+    gd_loss = _weighted_mean(anti_wrapping_function(gd_r - gd_g), gd_weight)
+    iaf_loss = _weighted_mean(anti_wrapping_function(iaf_r - iaf_g), iaf_weight)
     
     return ip_loss, gd_loss, iaf_loss
 
@@ -141,4 +172,3 @@ def pesq_score(utts_r, utts_g, cfg):
     # Calculate mean PESQ score
     pesq_score = np.mean(pesq_scores)
     return pesq_score
-

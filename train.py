@@ -178,6 +178,7 @@ def train(rank, args, cfg):
     optim_g, optim_d = optimizers
     scheduler_g, scheduler_d = setup_schedulers(optimizers, cfg, last_epoch)
     max_grad_norm = cfg['training_cfg'].get('max_grad_norm', 5.0)
+    use_phase_weight = cfg['training_cfg'].get('phase_weighted_loss', False)
 
     # Create trainset and train_loader
     trainset = create_dataset(cfg, train=True, split=True, device=device)
@@ -251,7 +252,8 @@ def train(rank, args, cfg):
             # L2 Magnitude Loss
             loss_mag = F.mse_loss(clean_mag, mag_g)
             # Anti-wrapping Phase Loss
-            loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g, cfg)
+            phase_weight = clean_mag if use_phase_weight else None
+            loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g, cfg, phase_weight)
             loss_pha = loss_ip + loss_gd + loss_iaf
             # L2 Complex Loss
             loss_com = F.mse_loss(clean_com, com_g) * 2
@@ -289,7 +291,7 @@ def train(rank, args, cfg):
                     with torch.no_grad():
                         metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
                         mag_error = F.mse_loss(clean_mag, mag_g).item()
-                        ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g, cfg)
+                        ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g, cfg, phase_weight)
                         pha_error = (loss_ip + loss_gd + loss_iaf).item()
                         com_error = F.mse_loss(clean_com, com_g).item()
                         time_error = F.l1_loss(clean_audio, audio_g).item()
@@ -416,6 +418,7 @@ def train(rank, args, cfg):
                             pha_g = torch.unsqueeze(pha_g, dim=0)
 
                             # com_g = com_g.squeeze()
+                            clean_mag_for_phase = clean_mag
                             clean_mag = clean_mag.squeeze()
                             # clean_pha = clean_pha.squeeze()
 
@@ -428,7 +431,8 @@ def train(rank, args, cfg):
 
 
                             val_mag_err_tot += F.mse_loss(clean_mag, mag_g).item()
-                            val_ip_err, val_gd_err, val_iaf_err = phase_losses(clean_pha, pha_g, cfg)
+                            val_phase_weight = clean_mag_for_phase if use_phase_weight else None
+                            val_ip_err, val_gd_err, val_iaf_err = phase_losses(clean_pha, pha_g, cfg, val_phase_weight)
                             val_pha_err_tot += (val_ip_err + val_gd_err + val_iaf_err).item()
                             val_com_err_tot += F.mse_loss(clean_com, com_g).item()
 
