@@ -302,6 +302,7 @@ class MambaSEUNet(nn.Module):
         self.phase_decoder = PhaseDecoder(pha_dec_cfg)
         self.phase_eps = cfg['model_cfg'].get('phase_eps', 1e-3)
         self.complex_residual_scale = cfg['model_cfg'].get('complex_residual_scale', 0.1)
+        self.complex_residual_gate_bias = cfg['model_cfg'].get('complex_residual_gate_bias', -2.0)
         self.complex_residual_decoder = nn.Sequential(
             nn.Conv2d(pha_dim[0], pha_dim[0] * 4, 1, 1, 0, bias=False),
             nn.PixelShuffle(2),
@@ -320,6 +321,25 @@ class MambaSEUNet(nn.Module):
         )
         nn.init.zeros_(self.complex_residual_decoder[-1].weight)
         nn.init.zeros_(self.complex_residual_decoder[-1].bias)
+        self.complex_residual_gate = nn.Sequential(
+            nn.Conv2d(pha_dim[0], pha_dim[0] * 4, 1, 1, 0, bias=False),
+            nn.PixelShuffle(2),
+            nn.Conv2d(
+                pha_dim[0],
+                pha_dim[0],
+                kernel_size=(1, 3),
+                stride=(2, 1),
+                padding=(0, 1),
+                groups=pha_dim[0],
+                bias=False
+            ),
+            nn.InstanceNorm2d(pha_dim[0], affine=True),
+            nn.PReLU(pha_dim[0]),
+            nn.Conv2d(pha_dim[0], cfg['model_cfg']['output_channel'], (1, 1))
+        )
+        nn.init.zeros_(self.complex_residual_gate[-1].weight)
+        nn.init.constant_(self.complex_residual_gate[-1].bias, self.complex_residual_gate_bias)
+        self.latest_aux = {}
 
     def forward(self, noisy_mag, noisy_pha):
         if not torch.isfinite(noisy_mag).all():
@@ -508,8 +528,16 @@ class MambaSEUNet(nn.Module):
         complex_residual = torch.tanh(self.complex_residual_decoder(pha_fused))
         if not torch.isfinite(complex_residual).all():
             raise RuntimeError('complex_residual contains NaN/Inf')
+        learned_gate = torch.sigmoid(self.complex_residual_gate(pha_fused))
+        if not torch.isfinite(learned_gate).all():
+            raise RuntimeError('complex_residual_gate contains NaN/Inf')
+        energy_gate = noisy_mag_4d / torch.clamp(
+            noisy_mag_4d.amax(dim=(2, 3), keepdim=True),
+            min=self.phase_eps
+        )
+        residual_gate = learned_gate * torch.clamp(energy_gate, min=0.0, max=1.0)
         res_real, res_imag = torch.chunk(complex_residual, 2, dim=1)
-        residual_scale = self.complex_residual_scale * noisy_mag_4d.squeeze(1)
+        residual_scale = self.complex_residual_scale * noisy_mag_4d.squeeze(1) * residual_gate.squeeze(1)
         res_real = rearrange(res_real.squeeze(1) * residual_scale, 'b t f -> b f t')
         res_imag = rearrange(res_imag.squeeze(1) * residual_scale, 'b t f -> b f t')
 
@@ -532,4 +560,8 @@ class MambaSEUNet(nn.Module):
         if not torch.isfinite(denoised_com).all():
             raise RuntimeError('denoised_com contains NaN/Inf')
 
+        self.latest_aux = {
+            'complex_residual': complex_residual,
+            'complex_residual_gate': residual_gate,
+        }
         return denoised_mag, pred_pha, denoised_com
