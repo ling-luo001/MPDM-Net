@@ -52,6 +52,19 @@ def setup_schedulers(optimizers, cfg, last_epoch):
     return scheduler_g, scheduler_d
 
 
+def get_model_attr(model, attr_name, default=None):
+    model_ref = model.module if isinstance(model, DistributedDataParallel) else model
+    return getattr(model_ref, attr_name, default)
+
+
+def complex_residual_regularization(generator):
+    aux = get_model_attr(generator, 'latest_aux', {})
+    applied_residual = aux.get('complex_residual_applied')
+    if applied_residual is None:
+        return None
+    return torch.mean(torch.sqrt(torch.clamp(torch.sum(applied_residual ** 2, dim=1), min=1e-12)))
+
+
 def create_val_dataset(cfg, train=True, split=True, device='cuda:0'):
     """Create dataset based on cfguration."""
     clean_json = cfg['data_cfg']['train_clean_json'] if train else cfg['data_cfg']['valid_clean_json']
@@ -179,6 +192,7 @@ def train(rank, args, cfg):
     scheduler_g, scheduler_d = setup_schedulers(optimizers, cfg, last_epoch)
     max_grad_norm = cfg['training_cfg'].get('max_grad_norm', 5.0)
     use_phase_weight = cfg['training_cfg'].get('phase_weighted_loss', False)
+    residual_reg_weight = cfg['training_cfg']['loss'].get('complex_residual_reg', 0.0)
 
     # Create trainset and train_loader
     trainset = create_dataset(cfg, train=True, split=True, device=device)
@@ -265,6 +279,9 @@ def train(rank, args, cfg):
             # Consistancy Loss
             _, _, rec_com = mag_phase_stft(audio_g, n_fft, hop_size, win_size, compress_factor, addeps=True)
             loss_con = F.mse_loss(com_g, rec_com) * 2
+            loss_residual = complex_residual_regularization(generator)
+            if loss_residual is None:
+                loss_residual = torch.zeros((), device=device)
 
             loss_gen_all = (
                 loss_metric * cfg['training_cfg']['loss']['metric'] +
@@ -272,7 +289,8 @@ def train(rank, args, cfg):
                 loss_pha * cfg['training_cfg']['loss']['phase'] +
                 loss_com * cfg['training_cfg']['loss']['complex'] +
                 loss_time * cfg['training_cfg']['loss']['time'] + 
-                loss_con * cfg['training_cfg']['loss']['consistancy']
+                loss_con * cfg['training_cfg']['loss']['consistancy'] +
+                loss_residual * residual_reg_weight
             )
 
             loss_gen_all.backward()
@@ -296,11 +314,14 @@ def train(rank, args, cfg):
                         com_error = F.mse_loss(clean_com, com_g).item()
                         time_error = F.l1_loss(clean_audio, audio_g).item()
                         con_error = F.mse_loss( com_g, rec_com ).item()
+                        residual_error = loss_residual.item()
 
                         print(
                             'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
-                            'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
-                                steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
+                            'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, '
+                            'Res Loss: {:4.3f}, s/b : {:4.3f}'.format(
+                                steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error,
+                                residual_error, time.time() - start_b
                             ), flush=True
                         )
 
@@ -335,6 +356,7 @@ def train(rank, args, cfg):
                     sw.add_scalar("Training/Complex Loss", com_error, steps)
                     sw.add_scalar("Training/Time Loss", time_error, steps)
                     sw.add_scalar("Training/Consistancy Loss", con_error, steps)
+                    sw.add_scalar("Training/Complex Residual Loss", residual_error, steps)
 
                 # If NaN happend in training period, RaiseError
                 if torch.isnan(loss_gen_all).any():

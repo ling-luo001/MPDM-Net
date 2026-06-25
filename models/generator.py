@@ -538,8 +538,10 @@ class MambaSEUNet(nn.Module):
         residual_gate = learned_gate * torch.clamp(energy_gate, min=0.0, max=1.0)
         res_real, res_imag = torch.chunk(complex_residual, 2, dim=1)
         residual_scale = self.complex_residual_scale * noisy_mag_4d.squeeze(1) * residual_gate.squeeze(1)
-        res_real = rearrange(res_real.squeeze(1) * residual_scale, 'b t f -> b f t')
-        res_imag = rearrange(res_imag.squeeze(1) * residual_scale, 'b t f -> b f t')
+        applied_res_real = res_real.squeeze(1) * residual_scale
+        applied_res_imag = res_imag.squeeze(1) * residual_scale
+        res_real = rearrange(applied_res_real, 'b t f -> b f t')
+        res_imag = rearrange(applied_res_imag, 'b t f -> b f t')
 
         enh_real = base_real + res_real
         enh_imag = base_imag + res_imag
@@ -563,5 +565,9 @@ class MambaSEUNet(nn.Module):
         self.latest_aux = {
             'complex_residual': complex_residual,
             'complex_residual_gate': residual_gate,
+            'complex_residual_applied': torch.stack(
+                (applied_res_real, applied_res_imag),
+                dim=1
+            ),
         }
         return denoised_mag, pred_pha, denoised_com
