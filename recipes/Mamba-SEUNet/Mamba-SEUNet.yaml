@@ -109,14 +109,14 @@ env_setting:
 
 # Datapath Configuratoin
 data_cfg:
-#  train_clean_json: data/mini_train_clean_list.json
-#  train_noisy_json: data/mini_train_noisy_list.json
-#  valid_clean_json: data/mini_val_clean_list.json
-#  valid_noisy_json: data/mini_val_noisy_list.json
-  train_clean_json: data/train_clean.json
-  train_noisy_json: data/train_noisy.json
-  valid_clean_json: data/valid_clean.json
-  valid_noisy_json: data/valid_noisy.json
+  train_clean_json: data/mini_train_clean_list.json
+  train_noisy_json: data/mini_train_noisy_list.json
+  valid_clean_json: data/mini_val_clean_list.json
+  valid_noisy_json: data/mini_val_noisy_list.json
+#  train_clean_json: data/train_clean.json
+#  train_noisy_json: data/train_noisy.json
+#  valid_clean_json: data/valid_clean.json
+#  valid_noisy_json: data/valid_noisy.json
   test_clean_json: data/test_clean.json
   test_noisy_json: data/test_noisy.json
 
