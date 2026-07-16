@@ -43,9 +43,19 @@ def log_model_info(rank, model, exp_path):
 
 def load_ckpts(args, device):
     """Load checkpoints if available."""
-    if os.path.isdir(args.exp_path):
-        cp_g = scan_checkpoint(args.exp_path, 'g_')
-        cp_do = scan_checkpoint(args.exp_path, 'do_')
+    ckpt_path = getattr(args, 'resume_from', None) or args.exp_path
+    if os.path.isdir(ckpt_path):
+        resume_step = getattr(args, 'resume_step', None)
+        if resume_step is not None:
+            cp_g = os.path.join(ckpt_path, f'g_{resume_step:08d}.pth')
+            cp_do = os.path.join(ckpt_path, f'do_{resume_step:08d}.pth')
+            if not os.path.isfile(cp_g) or not os.path.isfile(cp_do):
+                raise FileNotFoundError(
+                    f"Cannot find g/do checkpoints for step {resume_step} in {ckpt_path}"
+                )
+        else:
+            cp_g = scan_checkpoint(ckpt_path, 'g_')
+            cp_do = scan_checkpoint(ckpt_path, 'do_')
         if cp_g is None or cp_do is None:
             return None, None, 0, -1
         state_dict_g = load_checkpoint(cp_g, device)
@@ -80,9 +90,20 @@ def build_env(config, config_name, exp_path):
     if config != t_path:
         shutil.copyfile(config, t_path)
 
-def load_optimizer_states(optimizers, state_dict_do):
+def load_optimizer_states(optimizers, state_dict_do, cfg=None, resume_lr=None):
     """Load optimizer states from checkpoint."""
     if state_dict_do is not None:
         optim_g, optim_d = optimizers
         optim_g.load_state_dict(state_dict_do['optim_g'])
         optim_d.load_state_dict(state_dict_do['optim_d'])
+        if cfg is not None:
+            base_lr = cfg['training_cfg']['learning_rate']
+            for optimizer in (optim_g, optim_d):
+                for group in optimizer.param_groups:
+                    old_base_lr = group.get('initial_lr', group['lr'])
+                    group['initial_lr'] = base_lr
+                    if resume_lr is not None:
+                        group['lr'] = resume_lr
+                    else:
+                        decay_ratio = group['lr'] / old_base_lr if old_base_lr > 0 else 1.0
+                        group['lr'] = base_lr * decay_ratio

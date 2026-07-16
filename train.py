@@ -46,8 +46,11 @@ def setup_schedulers(optimizers, cfg, last_epoch):
     optim_g, optim_d = optimizers
     lr_decay = cfg['training_cfg']['lr_decay']
 
-    scheduler_g = optim.lr_scheduler.ExponentialLR(optim_g, gamma=lr_decay, last_epoch=last_epoch)
-    scheduler_d = optim.lr_scheduler.ExponentialLR(optim_d, gamma=lr_decay, last_epoch=last_epoch)
+    scheduler_g = optim.lr_scheduler.ExponentialLR(optim_g, gamma=lr_decay)
+    scheduler_d = optim.lr_scheduler.ExponentialLR(optim_d, gamma=lr_decay)
+    if last_epoch >= 0:
+        scheduler_g.last_epoch = last_epoch
+        scheduler_d.last_epoch = last_epoch
 
     return scheduler_g, scheduler_d
 
@@ -149,7 +152,7 @@ def train(rank, args, cfg):
 
     # Create optimizer and schedulers
     optimizers = setup_optimizers((generator, discriminator), cfg)
-    load_optimizer_states(optimizers, state_dict_do)
+    load_optimizer_states(optimizers, state_dict_do, cfg, args.resume_lr)
     # # 确保 optimizers 的顺序是 (generator_optim, discriminator_optim)
     # optim_g, optim_d = optimizers  # 显式解包，避免直接使用索引
     #
@@ -463,8 +466,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
     # parser.add_argument('--exp_name', default='Mambavision_emb_08')
-    parser.add_argument('--exp_name', default='main_codex_mask_B_mini')
+    parser.add_argument('--exp_name', default='main_codex_mask_B')
     parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
+    parser.add_argument('--resume_from', default=None,
+                        help='Optional checkpoint directory to load from while saving into exp_folder/exp_name.')
+    parser.add_argument('--resume_step', type=int, default=None,
+                        help='Optional checkpoint step to load from resume_from. Defaults to the latest step.')
+    parser.add_argument('--resume_lr', type=float, default=None,
+                        help='Optional effective optimizer learning rate after loading a checkpoint.')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
