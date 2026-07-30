@@ -161,7 +161,7 @@ model_cfg:
   expand: 4  # Expansion factor for the layers within the Mamba blocks.
   norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
   phase_eps: 0.001  # Floor for low-energy phase atan2 to keep backward finite.
-  restoration_width_ratio: 0.5  # Stage-2 width relative to the suppression tower.
+  restoration_width_ratio: 1.0  # Match Stage-2 restoration width to the suppression tower.
   complex_residual_gate_bias: -2.0  # Start with a conservative residual gate.
   beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
   input_channel: 2 # Magnitude and Phase
