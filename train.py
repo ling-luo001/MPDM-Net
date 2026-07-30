@@ -490,14 +490,20 @@ def main():
                         help='Optional effective optimizer learning rate after loading a checkpoint.')
     parser.add_argument('--mini', action='store_true',
                         help='Use the repository mini train/validation JSON lists.')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override training_cfg.training_epochs for this run.')
     parser.add_argument('--max_steps', type=int, default=None,
                         help='Stop before processing this global training step.')
     args = parser.parse_args()
 
+    if args.epochs is not None and args.epochs <= 0:
+        parser.error('--epochs must be a positive integer')
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error('--max_steps must be a positive integer')
 
     cfg = load_config(args.config)
+    if args.epochs is not None:
+        cfg['training_cfg']['training_epochs'] = args.epochs
     if args.mini:
         cfg['data_cfg'].update(MINI_DATA_CFG)
     seed = cfg['env_setting']['seed']
