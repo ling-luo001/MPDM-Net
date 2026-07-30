@@ -11,7 +11,7 @@ env_setting:
   summary_interval: 200
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:13407  # URL for initializing distributed training.
+    dist_url: tcp://localhost:29503  # Dedicated port for the Scheme-3 experiment.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
@@ -41,6 +41,10 @@ training_cfg:
     complex: 0.1
     time: 0.2
     consistancy: 0.1
+    coarse_complex: 0.1
+    pitch: 0.02
+    voicing: 0.01
+    harmonic_support: 0.01
   use_PCS400: True  # Use PCS or not
 
 # STFT Configuration
@@ -61,6 +65,17 @@ model_cfg:
   d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
   expand: 4  # Expansion factor for the layers within the Mamba blocks.
   norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
+  restoration_width_ratio: 1.0  # Full-capacity conditional restoration tower.
+  complex_residual_gate_bias: -2.0
+  deep_filter_offsets: [-2, -1, 1, 2]
+  deep_filter_gate_bias: -2.0
+  pitch_candidates: 64
+  pitch_min_f0: 60.0
+  pitch_max_f0: 500.0
+  pitch_temperature: 0.1
+  pitch_smoothing_bins: 9
+  harmonic_bandwidth_bins: 0.75
+  voicing_gate_bias: -1.0
   beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
   input_channel: 2 # Magnitude and Phase
   output_channel: 1  # Single Channel Speech Enhancement

@@ -39,6 +39,52 @@ MINI_DATA_CFG = {
 }
 
 
+def harmonic_generation_losses(generator, clean_mag, clean_com):
+    """Auxiliary objectives for suppression, source analysis, and restoration."""
+    aux = generator.latest_aux
+    required_keys = {
+        'coarse_complex',
+        'pitch_posterior',
+        'voicing',
+        'harmonic_prior',
+        'harmonic_residual',
+        'aperiodic_residual',
+    }
+    missing_keys = required_keys.difference(aux)
+    if missing_keys:
+        raise RuntimeError(f'Missing generator auxiliary outputs: {sorted(missing_keys)}')
+
+    loss_coarse_complex = F.mse_loss(clean_com, aux['coarse_complex']) * 2
+    with torch.no_grad():
+        clean_pitch, _, clean_pitch_confidence = generator.harmonic_analysis(clean_mag)
+
+    predicted_pitch = aux['pitch_posterior'].clamp_min(1e-8)
+    loss_pitch = F.kl_div(
+        predicted_pitch.log(), clean_pitch, reduction='none'
+    ).sum(dim=-1).mean()
+    predicted_voicing = aux['voicing'].squeeze(1).squeeze(-1)
+    loss_voicing = F.mse_loss(predicted_voicing, clean_pitch_confidence)
+
+    harmonic_prior = (
+        aux['harmonic_prior'].squeeze(1).permute(0, 2, 1).unsqueeze(-1).detach()
+    )
+    harmonic_residual = aux['harmonic_residual'].permute(0, 3, 2, 1)
+    aperiodic_residual = aux['aperiodic_residual'].permute(0, 3, 2, 1)
+    harmonic_leakage = (
+        harmonic_residual.abs() * (1.0 - harmonic_prior)
+    ).mean()
+    aperiodic_leakage = (
+        aperiodic_residual.abs() * harmonic_prior
+    ).mean()
+    loss_harmonic_support = harmonic_leakage + aperiodic_leakage
+    return {
+        'coarse_complex': loss_coarse_complex,
+        'pitch': loss_pitch,
+        'voicing': loss_voicing,
+        'harmonic_support': loss_harmonic_support,
+    }
+
+
 def setup_optimizers(models, cfg):
     """Set up optimizers for the models."""
     generator, discriminator = models
@@ -158,6 +204,9 @@ def train(rank, args, cfg):
     if num_gpus > 1 and torch.cuda.is_available():
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         discriminator = DistributedDataParallel(discriminator, device_ids=[rank]).to(device)
+    generator_core = generator.module if isinstance(
+        generator, DistributedDataParallel
+    ) else generator
 
     # Create optimizer and schedulers
     optimizers = setup_optimizers((generator, discriminator), cfg)
@@ -280,14 +329,22 @@ def train(rank, args, cfg):
             # Consistancy Loss
             _, _, rec_com = mag_phase_stft(audio_g, n_fft, hop_size, win_size, compress_factor, addeps=True)
             loss_con = F.mse_loss(com_g, rec_com) * 2
+            auxiliary_losses = harmonic_generation_losses(
+                generator_core, clean_mag, clean_com
+            )
+            loss_cfg = cfg['training_cfg']['loss']
 
             loss_gen_all = (
-                loss_metric * cfg['training_cfg']['loss']['metric'] +
-                loss_mag * cfg['training_cfg']['loss']['magnitude'] +
-                loss_pha * cfg['training_cfg']['loss']['phase'] +
-                loss_com * cfg['training_cfg']['loss']['complex'] +
-                loss_time * cfg['training_cfg']['loss']['time'] + 
-                loss_con * cfg['training_cfg']['loss']['consistancy']
+                loss_metric * loss_cfg['metric'] +
+                loss_mag * loss_cfg['magnitude'] +
+                loss_pha * loss_cfg['phase'] +
+                loss_com * loss_cfg['complex'] +
+                loss_time * loss_cfg['time'] +
+                loss_con * loss_cfg['consistancy'] +
+                auxiliary_losses['coarse_complex'] * loss_cfg['coarse_complex'] +
+                auxiliary_losses['pitch'] * loss_cfg['pitch'] +
+                auxiliary_losses['voicing'] * loss_cfg['voicing'] +
+                auxiliary_losses['harmonic_support'] * loss_cfg['harmonic_support']
             )
 
             loss_gen_all.backward()
@@ -311,12 +368,37 @@ def train(rank, args, cfg):
                         com_error = F.mse_loss(clean_com, com_g).item()
                         time_error = F.l1_loss(clean_audio, audio_g).item()
                         con_error = F.mse_loss( com_g, rec_com ).item()
+                        coarse_error = auxiliary_losses['coarse_complex'].item()
+                        pitch_error = auxiliary_losses['pitch'].item()
+                        voicing_error = auxiliary_losses['voicing'].item()
+                        support_error = auxiliary_losses['harmonic_support'].item()
+                        aux_snapshot = generator_core.latest_aux
+                        pitch_peak = aux_snapshot['pitch_posterior'].amax(dim=-1).mean().item()
+                        voicing_mean = aux_snapshot['voicing'].mean().item()
+                        deep_filter_activity = (
+                            aux_snapshot['deep_filter_coefficients'].abs().mean().item()
+                        )
+                        generated_activity = (
+                            aux_snapshot['complex_residual_applied'].abs().mean().item()
+                        )
 
                         print(
                             'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
-                            'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
-                                steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
+                            'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, '
+                            'Cons Loss: {:4.3f}, Coarse Loss: {:4.3f}, Pitch Loss: {:4.3f}, '
+                            'Voice Loss: {:4.3f}, Support Loss: {:4.3f}, s/b : {:4.3f}'.format(
+                                steps, loss_gen_all, loss_disc_all, metric_error, mag_error,
+                                pha_error, com_error, time_error, con_error, coarse_error,
+                                pitch_error, voicing_error, support_error, time.time() - start_b
                             ), flush=True
+                        )
+                        print(
+                            'Scheme3 diagnostics - Pitch peak: {:4.3f}, Voicing: {:4.3f}, '
+                            'Deep-filter activity: {:4.3f}, Generated activity: {:4.3f}'.format(
+                                pitch_peak, voicing_mean, deep_filter_activity,
+                                generated_activity
+                            ),
+                            flush=True
                         )
 
                 # Checkpointing
@@ -350,6 +432,41 @@ def train(rank, args, cfg):
                     sw.add_scalar("Training/Complex Loss", com_error, steps)
                     sw.add_scalar("Training/Time Loss", time_error, steps)
                     sw.add_scalar("Training/Consistancy Loss", con_error, steps)
+                    sw.add_scalar(
+                        "Training/Coarse Complex Loss",
+                        auxiliary_losses['coarse_complex'].item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/Pitch KL Loss", auxiliary_losses['pitch'].item(), steps
+                    )
+                    sw.add_scalar(
+                        "Training/Voicing Loss", auxiliary_losses['voicing'].item(), steps
+                    )
+                    sw.add_scalar(
+                        "Training/Harmonic Support Loss",
+                        auxiliary_losses['harmonic_support'].item(),
+                        steps
+                    )
+                    aux_snapshot = generator_core.latest_aux
+                    sw.add_scalar(
+                        "Training/Pitch Posterior Peak",
+                        aux_snapshot['pitch_posterior'].amax(dim=-1).mean().item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/Voicing Mean", aux_snapshot['voicing'].mean().item(), steps
+                    )
+                    sw.add_scalar(
+                        "Training/Deep Filter Activity",
+                        aux_snapshot['deep_filter_coefficients'].abs().mean().item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/Generated Residual Activity",
+                        aux_snapshot['complex_residual_applied'].abs().mean().item(),
+                        steps
+                    )
 
                 # If NaN happend in training period, RaiseError
                 if torch.isnan(loss_gen_all).any():

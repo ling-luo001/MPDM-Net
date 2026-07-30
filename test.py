@@ -28,7 +28,19 @@ def main():
     assert torch.isfinite(denoised_complex).all()
 
     aux = model.latest_aux
-    assert aux['restoration_gate'].shape == (batch_size, 1, frames, freq_bins)
+    num_side_filters = len(model.deep_filter_offsets)
+    assert aux['deep_filter_coefficients'].shape == (
+        batch_size, num_side_filters * 2, frames, freq_bins
+    )
+    assert aux['deep_filter_gates'].shape == (
+        batch_size, num_side_filters, frames, freq_bins
+    )
+    assert aux['pitch_posterior'].shape == (
+        batch_size, frames, model.pitch_candidates
+    )
+    assert aux['harmonic_prior'].shape == (batch_size, 1, frames, freq_bins)
+    assert aux['voicing'].shape == (batch_size, 1, frames, 1)
+    assert aux['restoration_gate'].shape == (batch_size, 2, frames, freq_bins)
     assert torch.allclose(denoised_complex, aux['coarse_complex'], atol=1e-6)
     assert torch.allclose(
         denoised_mag,
@@ -39,6 +51,26 @@ def main():
         torch.tensor(model.complex_residual_gate_bias, device=device)
     )
     assert torch.allclose(aux['restoration_gate'], expected_gate.expand_as(aux['restoration_gate']))
+    expected_deep_filter_gate = torch.sigmoid(
+        torch.tensor(model.deep_filter_gate_bias, device=device)
+    )
+    assert torch.allclose(
+        aux['deep_filter_gates'],
+        expected_deep_filter_gate.expand_as(aux['deep_filter_gates'])
+    )
+    expected_voicing = torch.sigmoid(
+        torch.tensor(model.voicing_gate_bias, device=device)
+    )
+    assert torch.allclose(aux['voicing'], expected_voicing.expand_as(aux['voicing']))
+    assert torch.count_nonzero(aux['deep_filter_coefficients']) == 0
+    assert torch.count_nonzero(aux['harmonic_residual']) == 0
+    assert torch.count_nonzero(aux['aperiodic_residual']) == 0
+    assert torch.allclose(
+        aux['pitch_posterior'].sum(dim=-1),
+        torch.ones(batch_size, frames, device=device),
+        atol=1e-6
+    )
+    assert torch.all((aux['harmonic_prior'] >= 0.0) & (aux['harmonic_prior'] <= 1.0))
     assert aux['suppression_context_scale'].item() == 0.0
 
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
@@ -48,7 +80,7 @@ def main():
         f'magnitude={tuple(denoised_mag.shape)}, '
         f'phase={tuple(pred_phase.shape)}, complex={tuple(denoised_complex.shape)}'
     )
-    print('progressive suppression-restoration smoke test passed')
+    print('harmonic-prior suppression-generation smoke test passed')
 
 
 if __name__ == '__main__':
