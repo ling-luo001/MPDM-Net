@@ -355,6 +355,11 @@ class MambaSEUNet(nn.Module):
         self.register_buffer('harmonic_templates', harmonic_templates, persistent=False)
 
         self.voicing_gate_bias = float(cfg['model_cfg'].get('voicing_gate_bias', -1.0))
+        self.voicing_confidence_power = float(
+            cfg['model_cfg'].get('voicing_confidence_power', 0.5)
+        )
+        if not 0.0 < self.voicing_confidence_power <= 1.0:
+            raise ValueError('voicing_confidence_power must be in (0, 1].')
         self.voicing_head = nn.Conv2d(mag_dim[0], 1, 1)
         nn.init.zeros_(self.voicing_head.weight)
         nn.init.constant_(self.voicing_head.bias, self.voicing_gate_bias)
@@ -597,8 +602,13 @@ class MambaSEUNet(nn.Module):
         voicing = torch.sigmoid(
             self.voicing_head(mag_final).mean(dim=-1, keepdim=True)
         )
-        harmonic_prior = raw_harmonic_prior * voicing
-        voicing_map = voicing.expand(-1, -1, -1, noisy_mag_4d.shape[-1])
+        # Train voicing only against its source-analysis teacher. Isolating the
+        # restoration gradient prevents a trivial all-aperiodic bypass.
+        conditioning_voicing = voicing.detach()
+        harmonic_prior = raw_harmonic_prior * conditioning_voicing
+        voicing_map = conditioning_voicing.expand(
+            -1, -1, -1, noisy_mag_4d.shape[-1]
+        )
 
         # Stage 2 restores details from the original/coarse spectra and source prior.
         restore_in = torch.cat(

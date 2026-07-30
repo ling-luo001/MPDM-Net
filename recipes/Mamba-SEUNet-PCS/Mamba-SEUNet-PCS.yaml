@@ -43,7 +43,7 @@ training_cfg:
     consistancy: 0.1
     coarse_complex: 0.1
     pitch: 0.02
-    voicing: 0.01
+    voicing: 0.05
     harmonic_support: 0.01
   use_PCS400: True  # Use PCS or not
 
@@ -76,6 +76,7 @@ model_cfg:
   pitch_smoothing_bins: 9
   harmonic_bandwidth_bins: 0.75
   voicing_gate_bias: -1.0
+  voicing_confidence_power: 0.5
   beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
   input_channel: 2 # Magnitude and Phase
   output_channel: 1  # Single Channel Speech Enhancement

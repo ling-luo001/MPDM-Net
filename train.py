@@ -57,13 +57,16 @@ def harmonic_generation_losses(generator, clean_mag, clean_com):
     loss_coarse_complex = F.mse_loss(clean_com, aux['coarse_complex']) * 2
     with torch.no_grad():
         clean_pitch, _, clean_pitch_confidence = generator.harmonic_analysis(clean_mag)
+        clean_voicing_target = clean_pitch_confidence.pow(
+            generator.voicing_confidence_power
+        )
 
     predicted_pitch = aux['pitch_posterior'].clamp_min(1e-8)
     loss_pitch = F.kl_div(
         predicted_pitch.log(), clean_pitch, reduction='none'
     ).sum(dim=-1).mean()
     predicted_voicing = aux['voicing'].squeeze(1).squeeze(-1)
-    loss_voicing = F.mse_loss(predicted_voicing, clean_pitch_confidence)
+    loss_voicing = F.mse_loss(predicted_voicing, clean_voicing_target)
 
     harmonic_prior = (
         aux['harmonic_prior'].squeeze(1).permute(0, 2, 1).unsqueeze(-1).detach()
@@ -82,6 +85,7 @@ def harmonic_generation_losses(generator, clean_mag, clean_com):
         'pitch': loss_pitch,
         'voicing': loss_voicing,
         'harmonic_support': loss_harmonic_support,
+        'voicing_target_mean': clean_voicing_target.mean(),
     }
 
 
@@ -375,6 +379,9 @@ def train(rank, args, cfg):
                         aux_snapshot = generator_core.latest_aux
                         pitch_peak = aux_snapshot['pitch_posterior'].amax(dim=-1).mean().item()
                         voicing_mean = aux_snapshot['voicing'].mean().item()
+                        voicing_target_mean = auxiliary_losses[
+                            'voicing_target_mean'
+                        ].item()
                         deep_filter_activity = (
                             aux_snapshot['deep_filter_coefficients'].abs().mean().item()
                         )
@@ -394,9 +401,10 @@ def train(rank, args, cfg):
                         )
                         print(
                             'Scheme3 diagnostics - Pitch peak: {:4.3f}, Voicing: {:4.3f}, '
+                            'Voice target: {:4.3f}, '
                             'Deep-filter activity: {:4.3f}, Generated activity: {:4.3f}'.format(
-                                pitch_peak, voicing_mean, deep_filter_activity,
-                                generated_activity
+                                pitch_peak, voicing_mean, voicing_target_mean,
+                                deep_filter_activity, generated_activity
                             ),
                             flush=True
                         )
@@ -456,6 +464,11 @@ def train(rank, args, cfg):
                     )
                     sw.add_scalar(
                         "Training/Voicing Mean", aux_snapshot['voicing'].mean().item(), steps
+                    )
+                    sw.add_scalar(
+                        "Training/Voicing Target Mean",
+                        auxiliary_losses['voicing_target_mean'].item(),
+                        steps
                     )
                     sw.add_scalar(
                         "Training/Deep Filter Activity",
