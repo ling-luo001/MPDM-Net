@@ -388,6 +388,12 @@ def train(rank, args, cfg):
                         generated_activity = (
                             aux_snapshot['complex_residual_applied'].abs().mean().item()
                         )
+                        dense_bridge_scale = (
+                            aux_snapshot['dense_bridge_scales'].abs().mean().item()
+                        )
+                        transition_residual_scale = (
+                            aux_snapshot['transition_residual_scales'].abs().mean().item()
+                        )
 
                         print(
                             'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
@@ -400,11 +406,13 @@ def train(rank, args, cfg):
                             ), flush=True
                         )
                         print(
-                            'Scheme3 diagnostics - Pitch peak: {:4.3f}, Voicing: {:4.3f}, '
+                            'Residual-dense diagnostics - Pitch peak: {:4.3f}, Voicing: {:4.3f}, '
                             'Voice target: {:4.3f}, '
-                            'Deep-filter activity: {:4.3f}, Generated activity: {:4.3f}'.format(
+                            'Deep-filter activity: {:4.3f}, Generated activity: {:4.3f}, '
+                            'Dense bridge scale: {:4.3f}, Transition scale: {:4.3f}'.format(
                                 pitch_peak, voicing_mean, voicing_target_mean,
-                                deep_filter_activity, generated_activity
+                                deep_filter_activity, generated_activity,
+                                dense_bridge_scale, transition_residual_scale
                             ),
                             flush=True
                         )
@@ -478,6 +486,16 @@ def train(rank, args, cfg):
                     sw.add_scalar(
                         "Training/Generated Residual Activity",
                         aux_snapshot['complex_residual_applied'].abs().mean().item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/Dense Bridge Scale",
+                        aux_snapshot['dense_bridge_scales'].abs().mean().item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/Transition Residual Scale",
+                        aux_snapshot['transition_residual_scales'].abs().mean().item(),
                         steps
                     )
 

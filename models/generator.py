@@ -124,9 +124,17 @@ class Downsample(nn.Module):
             # pw-linear
             nn.Conv2d(input_feat, out_feat // 4, 1, 1, 0, bias=False),
             nn.PixelUnshuffle(2))
+        rng_state = torch.random.get_rng_state()
+        self.shortcut = nn.Sequential(
+            nn.PixelUnshuffle(2),
+            nn.Conv2d(input_feat * 4, out_feat, 1, 1, 0, bias=False),
+            nn.GroupNorm(num_groups=1, num_channels=out_feat),
+        )
+        torch.random.set_rng_state(rng_state)
+        self.residual_scale = nn.Parameter(torch.zeros(()))
 
     def forward(self, x):
-        return self.body(x)
+        return self.body(x) + torch.tanh(self.residual_scale) * self.shortcut(x)
 
 
 class Upsample(nn.Module):
@@ -139,9 +147,65 @@ class Upsample(nn.Module):
             # pw-linear
             nn.Conv2d(input_feat, out_feat * 4, 1, 1, 0, bias=False),
             nn.PixelShuffle(2))
+        rng_state = torch.random.get_rng_state()
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(input_feat, out_feat * 4, 1, 1, 0, bias=False),
+            nn.PixelShuffle(2),
+            nn.GroupNorm(num_groups=1, num_channels=out_feat),
+        )
+        torch.random.set_rng_state(rng_state)
+        self.residual_scale = nn.Parameter(torch.zeros(()))
 
     def forward(self, x):
-        return self.body(x)
+        return self.body(x) + torch.tanh(self.residual_scale) * self.shortcut(x)
+
+
+class ResidualDenseBridge(nn.Module):
+    """Fuse same-resolution states through a zero-start residual adapter."""
+
+    def __init__(self, target_channels, context_channels, width_ratio=0.5):
+        super().__init__()
+        self.context_channels = tuple(int(channels) for channels in context_channels)
+        total_channels = target_channels + sum(self.context_channels)
+        hidden_channels = max(4, int(round(target_channels * width_ratio)))
+        self.fusion = nn.Sequential(
+            nn.GroupNorm(num_groups=1, num_channels=total_channels),
+            nn.Conv2d(total_channels, hidden_channels, 1, 1, 0, bias=False),
+            nn.PReLU(hidden_channels),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                3,
+                1,
+                1,
+                groups=hidden_channels,
+                bias=False
+            ),
+            nn.GroupNorm(num_groups=1, num_channels=hidden_channels),
+            nn.PReLU(hidden_channels),
+            nn.Conv2d(hidden_channels, target_channels, 1, 1, 0, bias=False),
+        )
+        self.residual_scale = nn.Parameter(torch.zeros(()))
+
+    def forward(self, target, *contexts):
+        if len(contexts) != len(self.context_channels):
+            raise ValueError(
+                f'Expected {len(self.context_channels)} contexts, got {len(contexts)}.'
+            )
+        for index, (context, channels) in enumerate(
+            zip(contexts, self.context_channels)
+        ):
+            if context.shape[1] != channels:
+                raise ValueError(
+                    f'Context {index} has {context.shape[1]} channels, expected {channels}.'
+                )
+            if context.shape[0] != target.shape[0] or context.shape[2:] != target.shape[2:]:
+                raise ValueError(
+                    f'Context {index} shape {tuple(context.shape)} is incompatible with '
+                    f'target {tuple(target.shape)}.'
+                )
+        update = self.fusion(torch.cat((target, *contexts), dim=1))
+        return target + torch.tanh(self.residual_scale) * update
 
 
 def _make_full_resolution_head(in_channels, out_channels, output_bias=0.0):
@@ -198,6 +262,11 @@ class MambaSEUNet(nn.Module):
         self.mag_dim = [mag_base, mag_base * 2, mag_base * 3]
         self.restore_dim = [restore_base, restore_base * 2, restore_base * 3]
         mag_dim, restore_dim = self.mag_dim, self.restore_dim
+        self.dense_bridge_width_ratio = float(
+            cfg['model_cfg'].get('dense_bridge_width_ratio', 0.5)
+        )
+        if not 0.0 < self.dense_bridge_width_ratio <= 2.0:
+            raise ValueError('dense_bridge_width_ratio must be in (0, 2].')
 
         # --- 1. 初始化输入配置 ---
         mag_cfg = deepcopy(cfg)
@@ -281,6 +350,32 @@ class MambaSEUNet(nn.Module):
             [TMambaBlock(cfg, restore_dim[0]) for _ in range(self.num_tscblocks)]
         )
         self.restore_output = nn.Conv2d(restore_dim[0], restore_dim[0], 3, 1, 1, bias=False)
+
+        bridge_ratio = self.dense_bridge_width_ratio
+        rng_state = torch.random.get_rng_state()
+        self.dense_bridges = nn.ModuleDict({
+            'encoder_level1': ResidualDenseBridge(
+                restore_dim[0], [mag_dim[0], mag_dim[0], mag_dim[0]], bridge_ratio
+            ),
+            'encoder_level2': ResidualDenseBridge(
+                restore_dim[1], [mag_dim[1], mag_dim[1]], bridge_ratio
+            ),
+            'middle': ResidualDenseBridge(
+                restore_dim[2],
+                [mag_dim[2]] * (self.num_mid_pairs + 1),
+                bridge_ratio
+            ),
+            'decoder_level2': ResidualDenseBridge(
+                restore_dim[1], [mag_dim[1], mag_dim[1]], bridge_ratio
+            ),
+            'decoder_level1': ResidualDenseBridge(
+                restore_dim[0], [mag_dim[0], mag_dim[0], mag_dim[0]], bridge_ratio
+            ),
+            'output': ResidualDenseBridge(
+                restore_dim[0], [mag_dim[0]], bridge_ratio
+            ),
+        })
+        torch.random.set_rng_state(rng_state)
 
         # One-way suppression context. Zero initialization lets restoration
         # first learn from [X, S0], then opt into bottleneck guidance.
@@ -509,9 +604,11 @@ class MambaSEUNet(nn.Module):
 
         mag_x3 = self.mag_down2_3(mag_x2)
         mag_x3 = self.mag_patch_embed_middle(mag_x3)
+        suppress_middle_features = [mag_x3]
         for fm_block, tm_block in zip(self.mag_FM_middle, self.mag_TM_middle):
             mag_x3 = fm_block(mag_x3)
             mag_x3 = tm_block(mag_x3)
+            suppress_middle_features.append(mag_x3)
         suppress_bottleneck = mag_x3
 
         # Stage 1 decoder and coarse complex-spectrum reconstruction.
@@ -629,6 +726,9 @@ class MambaSEUNet(nn.Module):
         for block in self.restore_TMamba1_encoder:
             restore_x1 = block(restore_x1)
         restore_x1 = restore_copy1 + restore_x1
+        restore_x1 = self.dense_bridges['encoder_level1'](
+            restore_x1, mag_skip1, mag_y1, mag_final
+        )
         restore_skip1 = restore_x1
 
         restore_x2 = self.restore_down1_2(restore_x1)
@@ -637,6 +737,9 @@ class MambaSEUNet(nn.Module):
         for block in self.restore_TMamba2_encoder:
             restore_x2 = block(restore_x2)
         restore_x2 = restore_copy2 + restore_x2
+        restore_x2 = self.dense_bridges['encoder_level2'](
+            restore_x2, mag_skip2, mag_y2
+        )
         restore_skip2 = restore_x2
 
         restore_x3 = self.restore_down2_3(restore_x2)
@@ -649,6 +752,9 @@ class MambaSEUNet(nn.Module):
             )
         context_scale = torch.tanh(self.suppress_context_scale)
         restore_x3 = restore_x3 + context_scale * suppression_context
+        restore_x3 = self.dense_bridges['middle'](
+            restore_x3, *suppress_middle_features
+        )
         for tm_block, fm_block in zip(self.restore_TM_middle, self.restore_FM_middle):
             restore_x3 = tm_block(restore_x3)
             restore_x3 = fm_block(restore_x3)
@@ -662,6 +768,9 @@ class MambaSEUNet(nn.Module):
         for block in self.restore_TMamba2_decoder:
             restore_y2 = block(restore_y2)
         restore_y2 = restore_y2_copy + restore_y2
+        restore_y2 = self.dense_bridges['decoder_level2'](
+            restore_y2, mag_skip2, mag_y2
+        )
 
         restore_y1 = self.restore_up2_1(restore_y2)
         restore_y1 = self.restore_concat_level1(
@@ -672,12 +781,16 @@ class MambaSEUNet(nn.Module):
         for block in self.restore_TMamba1_decoder:
             restore_y1 = block(restore_y1)
         restore_y1 = restore_y1_copy + restore_y1
+        restore_y1 = self.dense_bridges['decoder_level1'](
+            restore_y1, mag_skip1, mag_y1, mag_final
+        )
 
         restore_copy_ref = restore_y1
         restore_y1 = self.restore_patch_embed_refinement(restore_y1)
         for block in self.restore_refinement:
             restore_y1 = block(restore_y1)
         restore_final = self.restore_output(restore_y1 + restore_copy_ref) + restore_skip1
+        restore_final = self.dense_bridges['output'](restore_final, mag_final)
 
         harmonic_residual = torch.tanh(
             self.harmonic_residual_decoder(restore_final)
@@ -746,6 +859,23 @@ class MambaSEUNet(nn.Module):
         if not torch.isfinite(denoised_com).all():
             raise RuntimeError('denoised_com contains NaN/Inf')
 
+        dense_bridge_scales = torch.stack([
+            torch.tanh(bridge.residual_scale)
+            for bridge in self.dense_bridges.values()
+        ])
+        transition_residual_scales = torch.stack([
+            torch.tanh(module.residual_scale)
+            for module in (
+                self.mag_down1_2,
+                self.mag_down2_3,
+                self.mag_up3_2,
+                self.mag_up2_1,
+                self.restore_down1_2,
+                self.restore_down2_3,
+                self.restore_up3_2,
+                self.restore_up2_1,
+            )
+        ])
         self.latest_aux = {
             'coarse_complex': torch.stack((coarse_real, coarse_imag), dim=-1),
             'deep_filter_coefficients': deep_filter_coefficients,
@@ -766,5 +896,7 @@ class MambaSEUNet(nn.Module):
             ),
             'complex_residual_applied': torch.stack((applied_real, applied_imag), dim=-1),
             'suppression_context_scale': context_scale,
+            'dense_bridge_scales': dense_bridge_scales,
+            'transition_residual_scales': transition_residual_scales,
         }
         return denoised_mag, pred_pha, denoised_com

@@ -41,6 +41,8 @@ def main():
     assert aux['harmonic_prior'].shape == (batch_size, 1, frames, freq_bins)
     assert aux['voicing'].shape == (batch_size, 1, frames, 1)
     assert aux['restoration_gate'].shape == (batch_size, 2, frames, freq_bins)
+    assert aux['dense_bridge_scales'].shape == (6,)
+    assert aux['transition_residual_scales'].shape == (8,)
     assert torch.allclose(denoised_complex, aux['coarse_complex'], atol=1e-6)
     assert torch.allclose(
         denoised_mag,
@@ -65,6 +67,8 @@ def main():
     assert torch.count_nonzero(aux['deep_filter_coefficients']) == 0
     assert torch.count_nonzero(aux['harmonic_residual']) == 0
     assert torch.count_nonzero(aux['aperiodic_residual']) == 0
+    assert torch.count_nonzero(aux['dense_bridge_scales']) == 0
+    assert torch.count_nonzero(aux['transition_residual_scales']) == 0
     assert torch.allclose(
         aux['pitch_posterior'].sum(dim=-1),
         torch.ones(batch_size, frames, device=device),
@@ -80,7 +84,7 @@ def main():
         f'magnitude={tuple(denoised_mag.shape)}, '
         f'phase={tuple(pred_phase.shape)}, complex={tuple(denoised_complex.shape)}'
     )
-    print('harmonic-prior suppression-generation smoke test passed')
+    print('hierarchical residual-dense harmonic restoration smoke test passed')
 
 
 if __name__ == '__main__':
