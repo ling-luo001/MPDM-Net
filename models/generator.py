@@ -6,8 +6,7 @@ import math
 from torchvision.ops.deform_conv import DeformConv2d
 from einops import rearrange
 from copy import deepcopy
-from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
-from .cross import VSSBlock_Cross_new
+from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
 import torch.nn.functional as F
 
@@ -147,11 +146,12 @@ class Upsample(nn.Module):
 
 class MambaSEUNet(nn.Module):
     """
-    解耦双塔 Mamba 语音增强模型 (Research Version)
+    Progressive suppression-restoration Mamba speech enhancement model.
 
-    架构逻辑：
-    1. Magnitude Tower (Mag): 采用 FMamba，固定时间轴观察频率轴，学习谱包络（谐波、共振峰）。
-    2. Phase Tower (Pha): 采用 TMamba，固定频率轴观察时间轴，学习相位的时域演变（连续性）。
+    Stage 1 predicts a coarse complex spectrum from a magnitude mask and a
+    lightweight phase rotation. Stage 2 receives both the original and coarse
+    complex spectra, then predicts a gated complex residual. Suppression
+    features guide restoration through a one-way bottleneck connection.
     """
 
     def __init__(self, cfg):
@@ -159,36 +159,30 @@ class MambaSEUNet(nn.Module):
         self.cfg = cfg
         self.num_tscblocks = cfg['model_cfg'].get('num_tfmamba', 4)
         self.num_mid_pairs = int(cfg['model_cfg'].get('num_mid_pairs', 2))
-        self.num_mid_pairs = max(1, min(4, self.num_mid_pairs))  # 保证1-4范围
-        self.num_mid_stages = self.num_mid_pairs * 2  # 每对包含2次交替，需2个fusion
-        # 交叉注意力稀疏/局部窗口配置
-        self.cross_sparse = False
-        self.cross_sparse_window = cfg['model_cfg'].get('cross_sparse_window', 64)
-        self.cross_global_window = cfg['model_cfg'].get('cross_global_window', 8)
-        self.cross_sparsity = cfg['model_cfg'].get('cross_sparsity', 0.9)
+        self.num_mid_pairs = max(1, min(4, self.num_mid_pairs))
 
-        # 维度设置: Mag 保持原始，Pha 减半
+        # Keep suppression full-width and use a narrower restoration tower.
         mag_base = cfg['model_cfg']['hid_feature']
-        pha_base = max(1, mag_base // 2)
+        restore_width_ratio = float(cfg['model_cfg'].get('restoration_width_ratio', 0.5))
+        if not 0.0 < restore_width_ratio <= 1.0:
+            raise ValueError('restoration_width_ratio must be in (0, 1]')
+        restore_base = max(1, int(round(mag_base * restore_width_ratio)))
+        if restore_base % 4 != 0:
+            raise ValueError(
+                'The restoration base width must be divisible by 4 for PixelUnshuffle.'
+            )
         self.mag_dim = [mag_base, mag_base * 2, mag_base * 3]
-        self.pha_dim = [pha_base, pha_base * 2, pha_base * 3]  # 约等于 [H/2, H, 1.5H]
-        mag_dim, pha_dim = self.mag_dim, self.pha_dim
-        self.cross_pool_t = cfg['model_cfg'].get('cross_pool_t', 1)
-        self.cross_pool_f = cfg['model_cfg'].get('cross_pool_f', 1)
-        # 独立控制中间层与最终层的交叉注意力下采样，middle 默认不下采样
-        self.cross_pool_t_mid = cfg['model_cfg'].get('cross_pool_t_mid', 1)
-        self.cross_pool_f_mid = cfg['model_cfg'].get('cross_pool_f_mid', 1)
-        self.cross_pool_t_final = cfg['model_cfg'].get('cross_pool_t_final', self.cross_pool_t)
-        self.cross_pool_f_final = cfg['model_cfg'].get('cross_pool_f_final', self.cross_pool_f)
+        self.restore_dim = [restore_base, restore_base * 2, restore_base * 3]
+        mag_dim, restore_dim = self.mag_dim, self.restore_dim
 
         # --- 1. 初始化输入配置 ---
         mag_cfg = deepcopy(cfg)
         mag_cfg['model_cfg']['input_channel'] = 2
         mag_cfg['model_cfg']['hid_feature'] = mag_base
 
-        pha_cfg = deepcopy(cfg)
-        pha_cfg['model_cfg']['input_channel'] = 2
-        pha_cfg['model_cfg']['hid_feature'] = pha_base
+        restore_cfg = deepcopy(cfg)
+        restore_cfg['model_cfg']['input_channel'] = 4
+        restore_cfg['model_cfg']['hid_feature'] = restore_base
 
         # --- 2. Magnitude Tower 模块定义 (频域建模) ---
         self.mag_encoder = DenseEncoder(mag_cfg)
@@ -222,140 +216,133 @@ class MambaSEUNet(nn.Module):
         self.mag_refinement = nn.ModuleList([TFMambaBlock(cfg, mag_dim[0]) for _ in range(self.num_tscblocks)])
         self.mag_output = nn.Sequential(nn.Conv2d(mag_dim[0], mag_dim[0], 3, 1, 1, bias=False))
 
-        # --- 3. Phase Tower 模块定义 (时域建模) ---
-        self.pha_encoder = DenseEncoder(pha_cfg)
-        # Encoder 路径
-        self.pha_patch_embed_encoder_level1 = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_TSMamba1_encoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
-        self.pha_down1_2 = Downsample(pha_dim[0], pha_dim[1])
-
-        self.pha_patch_embed_encoder_level2 = Patch_Embed_stage(pha_dim[1], pha_dim[1])
-        self.pha_TSMamba2_encoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
-        self.pha_down2_3 = Downsample(pha_dim[1], pha_dim[2])
-
-        # Bottleneck 中间层
-        self.pha_patch_embed_middle = Patch_Embed_stage(pha_dim[2], pha_dim[2])
-        self.pha_TM_middle = nn.ModuleList([TMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
-        self.pha_FM_middle = nn.ModuleList([FMambaBlock(cfg, pha_dim[2]) for _ in range(self.num_mid_pairs)])
-
-        # Decoder 路径
-        self.pha_up3_2 = Upsample(pha_dim[2], pha_dim[1])
-        self.pha_concat_level2 = nn.Sequential(nn.Conv2d(pha_dim[1] * 2, pha_dim[1], 1, 1, 0, bias=False))
-        self.pha_patch_embed_decoder_level2 = Patch_Embed_stage(pha_dim[1], pha_dim[1])
-        self.pha_TSMamba2_decoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[1]) for _ in range(self.num_tscblocks)])
-
-        self.pha_up2_1 = Upsample(pha_dim[1], pha_dim[0])
-        self.pha_concat_level1 = nn.Sequential(nn.Conv2d(pha_dim[0] * 2, pha_dim[0], 1, 1, 0, bias=False))
-        self.pha_patch_embed_decoder_level1 = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_TSMamba1_decoder = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
-
-        # Refinement 细化层
-        self.pha_patch_embed_refinement = Patch_Embed_stage(pha_dim[0], pha_dim[0])
-        self.pha_refinement = nn.ModuleList([TMambaBlock(cfg, pha_dim[0]) for _ in range(self.num_tscblocks)])
-        self.pha_output = nn.Sequential(nn.Conv2d(pha_dim[0], pha_dim[0], 3, 1, 1, bias=False))
-
-        # --- 5. 双流 VSS 融合模块 ---
-        # 1) 独立投影到高维 3H
-        self.mid_in_proj_mag = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(mag_dim[2], mag_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        self.mid_in_proj_pha = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(pha_dim[2], mag_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        # 2) VSS 交互（同维 3H）
-        self.mid_fusions = nn.ModuleList([VSSBlock_Cross_new(hidden_dim=mag_dim[2]) for _ in range(self.num_mid_stages)])
-        # 3) 融合后还原各自宽度
-        self.mid_fusion_proj_mag = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(mag_dim[2] * 2, mag_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        self.mid_fusion_proj_pha = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(pha_dim[2] + mag_dim[2], pha_dim[2], 1, 1, 0, bias=False),
-                nn.GroupNorm(num_groups=1, num_channels=pha_dim[2])
-            ) for _ in range(self.num_mid_stages)
-        ])
-        # 全局融合前将 Pha 提升到 Mag 宽度
-        self.global_in_proj_pha = nn.Sequential(
-            nn.Conv2d(pha_dim[0], mag_dim[0], 1, 1, 0, bias=False),
-            nn.GroupNorm(num_groups=1, num_channels=mag_dim[0])
+        # --- 3. Narrow complex restoration tower ---
+        self.restore_encoder = DenseEncoder(restore_cfg)
+        self.restore_patch_embed_encoder_level1 = Patch_Embed_stage(restore_dim[0], restore_dim[0])
+        self.restore_TMamba1_encoder = nn.ModuleList(
+            [TMambaBlock(cfg, restore_dim[0]) for _ in range(self.num_tscblocks)]
         )
-        self.global_fusion = VSSBlock_Cross_new(hidden_dim=mag_dim[0])
-        self.global_out_proj_pha = nn.Sequential(
-            nn.Conv2d(pha_dim[0] + mag_dim[0], pha_dim[0], 1, 1, 0, bias=False),
-            nn.GroupNorm(num_groups=1, num_channels=pha_dim[0])
+        self.restore_down1_2 = Downsample(restore_dim[0], restore_dim[1])
+
+        self.restore_patch_embed_encoder_level2 = Patch_Embed_stage(restore_dim[1], restore_dim[1])
+        self.restore_TMamba2_encoder = nn.ModuleList(
+            [TMambaBlock(cfg, restore_dim[1]) for _ in range(self.num_tscblocks)]
+        )
+        self.restore_down2_3 = Downsample(restore_dim[1], restore_dim[2])
+
+        self.restore_patch_embed_middle = Patch_Embed_stage(restore_dim[2], restore_dim[2])
+        self.restore_TM_middle = nn.ModuleList(
+            [TMambaBlock(cfg, restore_dim[2]) for _ in range(self.num_mid_pairs)]
+        )
+        self.restore_FM_middle = nn.ModuleList(
+            [FMambaBlock(cfg, restore_dim[2]) for _ in range(self.num_mid_pairs)]
         )
 
-        # --- 4. 最终解码器 ---
+        self.restore_up3_2 = Upsample(restore_dim[2], restore_dim[1])
+        self.restore_concat_level2 = nn.Conv2d(restore_dim[1] * 2, restore_dim[1], 1, 1, 0, bias=False)
+        self.restore_patch_embed_decoder_level2 = Patch_Embed_stage(restore_dim[1], restore_dim[1])
+        self.restore_TMamba2_decoder = nn.ModuleList(
+            [TMambaBlock(cfg, restore_dim[1]) for _ in range(self.num_tscblocks)]
+        )
+
+        self.restore_up2_1 = Upsample(restore_dim[1], restore_dim[0])
+        self.restore_concat_level1 = nn.Conv2d(restore_dim[0] * 2, restore_dim[0], 1, 1, 0, bias=False)
+        self.restore_patch_embed_decoder_level1 = Patch_Embed_stage(restore_dim[0], restore_dim[0])
+        self.restore_TMamba1_decoder = nn.ModuleList(
+            [TMambaBlock(cfg, restore_dim[0]) for _ in range(self.num_tscblocks)]
+        )
+
+        self.restore_patch_embed_refinement = Patch_Embed_stage(restore_dim[0], restore_dim[0])
+        self.restore_refinement = nn.ModuleList(
+            [TMambaBlock(cfg, restore_dim[0]) for _ in range(self.num_tscblocks)]
+        )
+        self.restore_output = nn.Conv2d(restore_dim[0], restore_dim[0], 3, 1, 1, bias=False)
+
+        # One-way suppression context. Zero initialization lets restoration
+        # first learn from [X, S0], then opt into bottleneck guidance.
+        self.suppress_to_restore = nn.Sequential(
+            nn.Conv2d(mag_dim[2], restore_dim[2], 1, 1, 0, bias=False),
+            nn.GroupNorm(num_groups=1, num_channels=restore_dim[2]),
+        )
+        self.suppress_context_scale = nn.Parameter(torch.zeros(()))
+
+        # --- 4. Coarse and restoration output heads ---
         self.mag_to_mask_proj = nn.Conv2d(mag_dim[0], mag_base, 1, 1, 0, bias=False)
         self.mask_decoder = MagDecoder(cfg)
-        pha_dec_cfg = deepcopy(cfg)
-        pha_dec_cfg['model_cfg']['hid_feature'] = pha_base
-        self.phase_decoder = PhaseDecoder(pha_dec_cfg)
+        coarse_phase_cfg = deepcopy(cfg)
+        coarse_phase_cfg['model_cfg']['hid_feature'] = mag_base
+        self.coarse_phase_decoder = PhaseDecoder(coarse_phase_cfg)
+        nn.init.zeros_(self.coarse_phase_decoder.phase_conv_out.weight)
+        nn.init.zeros_(self.coarse_phase_decoder.phase_conv_out.bias)
+        with torch.no_grad():
+            self.coarse_phase_decoder.phase_conv_out.bias[0] = 1.0
+
         self.phase_eps = cfg['model_cfg'].get('phase_eps', 1e-3)
-        self.complex_residual_scale = cfg['model_cfg'].get('complex_residual_scale', 0.1)
         self.complex_residual_gate_bias = cfg['model_cfg'].get('complex_residual_gate_bias', -2.0)
-        self.complex_residual_decoder = nn.Sequential(
-            nn.Conv2d(pha_dim[0], pha_dim[0] * 4, 1, 1, 0, bias=False),
+        self.restoration_residual_decoder = nn.Sequential(
+            nn.Conv2d(restore_dim[0], restore_dim[0] * 4, 1, 1, 0, bias=False),
             nn.PixelShuffle(2),
             nn.Conv2d(
-                pha_dim[0],
-                pha_dim[0],
+                restore_dim[0],
+                restore_dim[0],
                 kernel_size=(1, 3),
                 stride=(2, 1),
                 padding=(0, 1),
-                groups=pha_dim[0],
+                groups=restore_dim[0],
                 bias=False
             ),
-            nn.InstanceNorm2d(pha_dim[0], affine=True),
-            nn.PReLU(pha_dim[0]),
-            nn.Conv2d(pha_dim[0], cfg['model_cfg']['output_channel'] * 2, (1, 1))
+            nn.InstanceNorm2d(restore_dim[0], affine=True),
+            nn.PReLU(restore_dim[0]),
+            nn.Conv2d(restore_dim[0], cfg['model_cfg']['output_channel'] * 2, (1, 1))
         )
-        nn.init.zeros_(self.complex_residual_decoder[-1].weight)
-        nn.init.zeros_(self.complex_residual_decoder[-1].bias)
-        self.complex_residual_gate = nn.Sequential(
-            nn.Conv2d(pha_dim[0], pha_dim[0] * 4, 1, 1, 0, bias=False),
+        nn.init.zeros_(self.restoration_residual_decoder[-1].weight)
+        nn.init.zeros_(self.restoration_residual_decoder[-1].bias)
+        self.restoration_gate = nn.Sequential(
+            nn.Conv2d(restore_dim[0], restore_dim[0] * 4, 1, 1, 0, bias=False),
             nn.PixelShuffle(2),
             nn.Conv2d(
-                pha_dim[0],
-                pha_dim[0],
+                restore_dim[0],
+                restore_dim[0],
                 kernel_size=(1, 3),
                 stride=(2, 1),
                 padding=(0, 1),
-                groups=pha_dim[0],
+                groups=restore_dim[0],
                 bias=False
             ),
-            nn.InstanceNorm2d(pha_dim[0], affine=True),
-            nn.PReLU(pha_dim[0]),
-            nn.Conv2d(pha_dim[0], cfg['model_cfg']['output_channel'], (1, 1))
+            nn.InstanceNorm2d(restore_dim[0], affine=True),
+            nn.PReLU(restore_dim[0]),
+            nn.Conv2d(restore_dim[0], cfg['model_cfg']['output_channel'], (1, 1))
         )
-        nn.init.zeros_(self.complex_residual_gate[-1].weight)
-        nn.init.constant_(self.complex_residual_gate[-1].bias, self.complex_residual_gate_bias)
+        nn.init.zeros_(self.restoration_gate[-1].weight)
+        nn.init.constant_(self.restoration_gate[-1].bias, self.complex_residual_gate_bias)
         self.latest_aux = {}
 
     def forward(self, noisy_mag, noisy_pha):
+        if noisy_mag.ndim != 3 or noisy_pha.ndim != 3:
+            raise ValueError('Expected noisy_mag and noisy_pha with shape [B, F, T].')
+        if noisy_mag.shape != noisy_pha.shape:
+            raise ValueError(
+                f'Input shapes differ: {tuple(noisy_mag.shape)} vs {tuple(noisy_pha.shape)}'
+            )
+        encoded_freq_bins = (noisy_mag.shape[1] + 1) // 2
+        if noisy_mag.shape[2] % 4 != 0 or encoded_freq_bins % 4 != 0:
+            raise ValueError(
+                'Time frames and encoded frequency bins must be divisible by 4; '
+                f'got T={noisy_mag.shape[2]}, encoded F={encoded_freq_bins}.'
+            )
         if not torch.isfinite(noisy_mag).all():
-             raise RuntimeError('Input noisy_mag contains NaN/Inf')
+            raise RuntimeError('Input noisy_mag contains NaN/Inf')
         if not torch.isfinite(noisy_pha).all():
-             raise RuntimeError('Input noisy_pha contains NaN/Inf')
+            raise RuntimeError('Input noisy_pha contains NaN/Inf')
 
         # [B, F, T] -> [B, 1, T, F]
         noisy_mag_4d = rearrange(noisy_mag, 'b f t -> b t f').unsqueeze(1)
         noisy_pha_4d = rearrange(noisy_pha, 'b f t -> b t f').unsqueeze(1)
-        # 双塔均使用原始 cat 输入；本分支只在最终高层特征处学习复数残差。
+        # Joint magnitude/phase input for coarse suppression.
         mag_in = torch.cat((noisy_mag_4d, noisy_pha_4d), dim=1)
-        pha_in = torch.cat((noisy_mag_4d, noisy_pha_4d), dim=1)
 
         # ---------------------------
-        # Magnitude Tower Encoder
+        # Stage 1: coarse suppression encoder
         # ---------------------------
         mag_x1 = self.mag_encoder(mag_in)
         mag_copy1 = mag_x1
@@ -375,174 +362,140 @@ class MambaSEUNet(nn.Module):
 
         mag_x3 = self.mag_down2_3(mag_x2)
         mag_x3 = self.mag_patch_embed_middle(mag_x3)
-        mag_fm_blocks = self.mag_FM_middle
-        mag_tm_blocks = self.mag_TM_middle
-        mag_prev = mag_x3
+        for fm_block, tm_block in zip(self.mag_FM_middle, self.mag_TM_middle):
+            mag_x3 = fm_block(mag_x3)
+            mag_x3 = tm_block(mag_x3)
+        suppress_bottleneck = mag_x3
 
-        # ---------------------------
-        # Phase Tower Encoder
-        # ---------------------------
-        pha_x1 = self.pha_encoder(pha_in)
-        pha_copy1 = pha_x1
-        pha_x1 = self.pha_patch_embed_encoder_level1(pha_x1)
-        for block in self.pha_TSMamba1_encoder:
-            pha_x1 = block(pha_x1)
-        pha_x1 = pha_copy1 + pha_x1
-        pha_skip1 = pha_x1
-
-        pha_x2 = self.pha_down1_2(pha_x1)
-        pha_copy2 = pha_x2
-        pha_x2 = self.pha_patch_embed_encoder_level2(pha_x2)
-        for block in self.pha_TSMamba2_encoder:
-            pha_x2 = block(pha_x2)
-        pha_x2 = pha_copy2 + pha_x2
-        pha_skip2 = pha_x2
-
-        pha_x3 = self.pha_down2_3(pha_x2)
-        pha_x3 = self.pha_patch_embed_middle(pha_x3)
-        pha_tm_blocks = self.pha_TM_middle
-        pha_fm_blocks = self.pha_FM_middle
-        pha_prev = pha_x3
-
-        # ---------------------------
-        # Middle交替：FM/TM 处理后立即耦合融合（取代交叉注意力）
-        stage_pairs = []
-        for idx in range(self.num_mid_stages):
-            pair_idx = idx // 2
-            if idx % 2 == 0:
-                stage_pairs.append((mag_fm_blocks[pair_idx], pha_tm_blocks[pair_idx]))
-            else:
-                stage_pairs.append((mag_tm_blocks[pair_idx], pha_fm_blocks[pair_idx]))
-        for idx, (mag_block, pha_block) in enumerate(stage_pairs):
-            mag_res, pha_res = mag_x3, pha_x3
-            mag_feat = mag_block(mag_x3)
-            pha_feat = pha_block(pha_x3)
-
-            mag_in_fuse = self.mid_in_proj_mag[idx](mag_feat)
-            pha_in_fuse = self.mid_in_proj_pha[idx](pha_feat)
-            mag_fused, pha_fused = self.mid_fusions[idx](mag_in_fuse, pha_in_fuse)
-
-            mag_cat = torch.cat([mag_feat, mag_fused], dim=1)
-            pha_cat = torch.cat([pha_feat, pha_fused], dim=1)
-            mag_x3 = self.mid_fusion_proj_mag[idx](mag_cat)
-            pha_x3 = self.mid_fusion_proj_pha[idx](pha_cat)
-            # 保持残差链路
-            mag_x3 = mag_x3 + mag_res
-            pha_x3 = pha_x3 + pha_res
-
-        # ---------------------------
-        # Decoder Level2 (after upsample+concat -> mamba -> residual)
-        # ---------------------------
+        # Stage 1 decoder and coarse complex-spectrum reconstruction.
         mag_y2 = self.mag_up3_2(mag_x3)
-        mag_y2 = torch.cat([mag_y2, mag_skip2], 1)
-        mag_y2 = self.mag_concat_level2(mag_y2)
+        mag_y2 = self.mag_concat_level2(torch.cat([mag_y2, mag_skip2], dim=1))
         mag_y2_copy = mag_y2
         mag_y2 = self.mag_patch_embed_decoder_level2(mag_y2)
         for block in self.mag_TSMamba2_decoder:
             mag_y2 = block(mag_y2)
-
-        pha_y2 = self.pha_up3_2(pha_x3)
-        pha_y2 = torch.cat([pha_y2, pha_skip2], 1)
-        pha_y2 = self.pha_concat_level2(pha_y2)
-        pha_y2_copy = pha_y2
-        pha_y2 = self.pha_patch_embed_decoder_level2(pha_y2)
-        for block in self.pha_TSMamba2_decoder:
-            pha_y2 = block(pha_y2)
-
         mag_y2 = mag_y2_copy + mag_y2
-        pha_y2 = pha_y2_copy + pha_y2
 
-        # ---------------------------
-        # Decoder Level1（已移除交叉注意力）
-        # ---------------------------
+        # Decode to the original encoder resolution.
         mag_y1 = self.mag_up2_1(mag_y2)
-        mag_y1 = torch.cat([mag_y1, mag_skip1], 1)
-        mag_y1 = self.mag_concat_level1(mag_y1)
+        mag_y1 = self.mag_concat_level1(torch.cat([mag_y1, mag_skip1], dim=1))
         mag_y1_copy = mag_y1
         mag_y1 = self.mag_patch_embed_decoder_level1(mag_y1)
         for block in self.mag_TSMamba1_decoder:
             mag_y1 = block(mag_y1)
-
-        pha_y1 = self.pha_up2_1(pha_y2)
-        pha_y1 = torch.cat([pha_y1, pha_skip1], 1)
-        pha_y1 = self.pha_concat_level1(pha_y1)
-        pha_y1_copy = pha_y1
-        pha_y1 = self.pha_patch_embed_decoder_level1(pha_y1)
-        for block in self.pha_TSMamba1_decoder:
-            pha_y1 = block(pha_y1)
-
         mag_y1 = mag_y1_copy + mag_y1
-        pha_y1 = pha_y1_copy + pha_y1
 
-        # Mag Refinement & Output
+        # Refine Stage 1 features before coarse reconstruction.
         mag_copy_ref = mag_y1
         mag_y1 = self.mag_patch_embed_refinement(mag_y1)
         for block in self.mag_refinement:
             mag_y1 = block(mag_y1)
         mag_final = self.mag_output(mag_y1 + mag_copy_ref) + mag_skip1
 
-        # Pha Refinement & Output
-        pha_copy_ref = pha_y1
-        pha_y1 = self.pha_patch_embed_refinement(pha_y1)
-        for block in self.pha_refinement:
-            pha_y1 = block(pha_y1)
-        pha_final = self.pha_output(pha_y1 + pha_copy_ref) + pha_skip1
-
-        # Final耦合融合（相位先升维到 Mag 再交互，输出后压回相位宽度）
-        mag_fused, pha_fused_high = self.global_fusion(mag_final, self.global_in_proj_pha(pha_final))
-        pha_fused = self.global_out_proj_pha(torch.cat([pha_final, pha_fused_high], dim=1))
-
-        if not torch.isfinite(pha_fused).all():
-             raise RuntimeError('pha_fused contains NaN/Inf')
-
-        # ---------------------------
-        # Final Signal Reconstruction
-        # ---------------------------
-        mag_mask = self.mask_decoder(self.mag_to_mask_proj(mag_fused))
+        # Coarse signal reconstruction.
+        mag_mask = self.mask_decoder(self.mag_to_mask_proj(mag_final))
         if not torch.isfinite(mag_mask).all():
             raise RuntimeError('mag_mask contains NaN/Inf')
-        denoised_mag = rearrange(mag_mask * noisy_mag_4d, 'b c t f -> b f t c').squeeze(-1)
+        coarse_mag_4d = mag_mask * noisy_mag_4d
 
         # Predict a unit complex rotation and apply it on the noisy phase unit vector.
-        if not torch.isfinite(denoised_mag).all():
-            raise RuntimeError('denoised_mag contains NaN/Inf')
-        rot_vec = self.phase_decoder(pha_fused)
-        rot_vec = F.normalize(rot_vec, dim=1, p=2, eps=1e-8)
+        rot_vec = self.coarse_phase_decoder(mag_final)
+        rot_vec = F.normalize(rot_vec, dim=1, p=2, eps=self.phase_eps)
         delta_cos, delta_sin = torch.chunk(rot_vec, 2, dim=1)
-        delta_cos = delta_cos.squeeze(1)  # [B, T, F]
-        delta_sin = delta_sin.squeeze(1)
 
-        noisy_cos = torch.cos(noisy_pha_4d).squeeze(1)  # [B, T, F]
-        noisy_sin = torch.sin(noisy_pha_4d).squeeze(1)  # [B, T, F]
+        noisy_cos = torch.cos(noisy_pha_4d)
+        noisy_sin = torch.sin(noisy_pha_4d)
 
-        pred_cos = noisy_cos * delta_cos - noisy_sin * delta_sin
-        pred_sin = noisy_sin * delta_cos + noisy_cos * delta_sin
+        coarse_cos = noisy_cos * delta_cos - noisy_sin * delta_sin
+        coarse_sin = noisy_sin * delta_cos + noisy_cos * delta_sin
 
-        # 对齐到 [B, F, T] 以匹配幅度分支
-        pred_cos = rearrange(pred_cos, 'b t f -> b f t')
-        pred_sin = rearrange(pred_sin, 'b t f -> b f t')
+        coarse_real_4d = coarse_mag_4d * coarse_cos
+        coarse_imag_4d = coarse_mag_4d * coarse_sin
+        if not torch.isfinite(coarse_real_4d).all() or not torch.isfinite(coarse_imag_4d).all():
+            raise RuntimeError('Coarse complex spectrum contains NaN/Inf')
 
-        base_real = denoised_mag * pred_cos
-        base_imag = denoised_mag * pred_sin
+        # Stage 2 restores details from the original and coarse complex spectra.
+        noisy_real_4d = noisy_mag_4d * noisy_cos
+        noisy_imag_4d = noisy_mag_4d * noisy_sin
+        restore_in = torch.cat(
+            [noisy_real_4d, noisy_imag_4d, coarse_real_4d, coarse_imag_4d],
+            dim=1
+        )
 
-        complex_residual = torch.tanh(self.complex_residual_decoder(pha_fused))
+        restore_x1 = self.restore_encoder(restore_in)
+        restore_copy1 = restore_x1
+        restore_x1 = self.restore_patch_embed_encoder_level1(restore_x1)
+        for block in self.restore_TMamba1_encoder:
+            restore_x1 = block(restore_x1)
+        restore_x1 = restore_copy1 + restore_x1
+        restore_skip1 = restore_x1
+
+        restore_x2 = self.restore_down1_2(restore_x1)
+        restore_copy2 = restore_x2
+        restore_x2 = self.restore_patch_embed_encoder_level2(restore_x2)
+        for block in self.restore_TMamba2_encoder:
+            restore_x2 = block(restore_x2)
+        restore_x2 = restore_copy2 + restore_x2
+        restore_skip2 = restore_x2
+
+        restore_x3 = self.restore_down2_3(restore_x2)
+        restore_x3 = self.restore_patch_embed_middle(restore_x3)
+        suppression_context = self.suppress_to_restore(suppress_bottleneck)
+        if suppression_context.shape != restore_x3.shape:
+            raise RuntimeError(
+                'Suppression/restoration bottleneck shapes differ: '
+                f'{tuple(suppression_context.shape)} vs {tuple(restore_x3.shape)}'
+            )
+        context_scale = torch.tanh(self.suppress_context_scale)
+        restore_x3 = restore_x3 + context_scale * suppression_context
+        for tm_block, fm_block in zip(self.restore_TM_middle, self.restore_FM_middle):
+            restore_x3 = tm_block(restore_x3)
+            restore_x3 = fm_block(restore_x3)
+
+        restore_y2 = self.restore_up3_2(restore_x3)
+        restore_y2 = self.restore_concat_level2(
+            torch.cat([restore_y2, restore_skip2], dim=1)
+        )
+        restore_y2_copy = restore_y2
+        restore_y2 = self.restore_patch_embed_decoder_level2(restore_y2)
+        for block in self.restore_TMamba2_decoder:
+            restore_y2 = block(restore_y2)
+        restore_y2 = restore_y2_copy + restore_y2
+
+        restore_y1 = self.restore_up2_1(restore_y2)
+        restore_y1 = self.restore_concat_level1(
+            torch.cat([restore_y1, restore_skip1], dim=1)
+        )
+        restore_y1_copy = restore_y1
+        restore_y1 = self.restore_patch_embed_decoder_level1(restore_y1)
+        for block in self.restore_TMamba1_decoder:
+            restore_y1 = block(restore_y1)
+        restore_y1 = restore_y1_copy + restore_y1
+
+        restore_copy_ref = restore_y1
+        restore_y1 = self.restore_patch_embed_refinement(restore_y1)
+        for block in self.restore_refinement:
+            restore_y1 = block(restore_y1)
+        restore_final = self.restore_output(restore_y1 + restore_copy_ref) + restore_skip1
+
+        complex_residual = torch.tanh(self.restoration_residual_decoder(restore_final))
         if not torch.isfinite(complex_residual).all():
             raise RuntimeError('complex_residual contains NaN/Inf')
-        learned_gate = torch.sigmoid(self.complex_residual_gate(pha_fused))
-        if not torch.isfinite(learned_gate).all():
-            raise RuntimeError('complex_residual_gate contains NaN/Inf')
-        energy_gate = noisy_mag_4d / torch.clamp(
-            noisy_mag_4d.amax(dim=(2, 3), keepdim=True),
-            min=self.phase_eps
-        )
-        residual_gate = learned_gate * torch.clamp(energy_gate, min=0.0, max=1.0)
-        res_real, res_imag = torch.chunk(complex_residual, 2, dim=1)
-        residual_scale = self.complex_residual_scale * noisy_mag_4d.squeeze(1) * residual_gate.squeeze(1)
-        res_real = rearrange(res_real.squeeze(1) * residual_scale, 'b t f -> b f t')
-        res_imag = rearrange(res_imag.squeeze(1) * residual_scale, 'b t f -> b f t')
+        restoration_gate = torch.sigmoid(self.restoration_gate(restore_final))
+        if not torch.isfinite(restoration_gate).all():
+            raise RuntimeError('restoration_gate contains NaN/Inf')
 
-        enh_real = base_real + res_real
-        enh_imag = base_imag + res_imag
+        residual_real_4d, residual_imag_4d = torch.chunk(complex_residual, 2, dim=1)
+        reference_mag_4d = 0.5 * (noisy_mag_4d + coarse_mag_4d)
+        applied_real_4d = restoration_gate * residual_real_4d * reference_mag_4d
+        applied_imag_4d = restoration_gate * residual_imag_4d * reference_mag_4d
+
+        coarse_real = rearrange(coarse_real_4d.squeeze(1), 'b t f -> b f t')
+        coarse_imag = rearrange(coarse_imag_4d.squeeze(1), 'b t f -> b f t')
+        applied_real = rearrange(applied_real_4d.squeeze(1), 'b t f -> b f t')
+        applied_imag = rearrange(applied_imag_4d.squeeze(1), 'b t f -> b f t')
+        enh_real = coarse_real + applied_real
+        enh_imag = coarse_imag + applied_imag
         denoised_mag = torch.sqrt(torch.clamp(enh_real ** 2 + enh_imag ** 2, min=1e-12))
         if not torch.isfinite(denoised_mag).all():
             raise RuntimeError('denoised_mag contains NaN/Inf')
@@ -552,16 +505,15 @@ class MambaSEUNet(nn.Module):
         if not torch.isfinite(pred_pha).all():
             raise RuntimeError('pred_pha contains NaN/Inf')
 
-        denoised_com = torch.stack(
-            (enh_real,
-             enh_imag),
-            dim=-1
-        )
+        denoised_com = torch.stack((enh_real, enh_imag), dim=-1)
         if not torch.isfinite(denoised_com).all():
             raise RuntimeError('denoised_com contains NaN/Inf')
 
         self.latest_aux = {
+            'coarse_complex': torch.stack((coarse_real, coarse_imag), dim=-1),
             'complex_residual': complex_residual,
-            'complex_residual_gate': residual_gate,
+            'restoration_gate': restoration_gate,
+            'complex_residual_applied': torch.stack((applied_real, applied_imag), dim=-1),
+            'suppression_context_scale': context_scale,
         }
         return denoised_mag, pred_pha, denoised_com

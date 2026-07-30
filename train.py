@@ -30,6 +30,15 @@ from utils.util import (
 
 torch.backends.cudnn.benchmark = True
 
+
+MINI_DATA_CFG = {
+    'train_clean_json': 'data/mini_train_clean_list.json',
+    'train_noisy_json': 'data/mini_train_noisy_list.json',
+    'valid_clean_json': 'data/mini_val_clean_list.json',
+    'valid_noisy_json': 'data/mini_val_noisy_list.json',
+}
+
+
 def setup_optimizers(models, cfg):
     """Set up optimizers for the models."""
     generator, discriminator = models
@@ -202,6 +211,11 @@ def train(rank, args, cfg):
             print("Epoch: {}".format(epoch+1))
 
         for i, batch in enumerate(train_loader):
+            if args.max_steps is not None and steps >= args.max_steps:
+                if rank == 0:
+                    sw.close()
+                    print(f'Reached max_steps={args.max_steps}; training stopped cleanly.')
+                return
             if rank == 0:
                 start_b = time.time()
             if len(batch) == 7:
@@ -474,9 +488,18 @@ def main():
                         help='Optional checkpoint step to load from resume_from. Defaults to the latest step.')
     parser.add_argument('--resume_lr', type=float, default=None,
                         help='Optional effective optimizer learning rate after loading a checkpoint.')
+    parser.add_argument('--mini', action='store_true',
+                        help='Use the repository mini train/validation JSON lists.')
+    parser.add_argument('--max_steps', type=int, default=None,
+                        help='Stop before processing this global training step.')
     args = parser.parse_args()
 
+    if args.max_steps is not None and args.max_steps <= 0:
+        parser.error('--max_steps must be a positive integer')
+
     cfg = load_config(args.config)
+    if args.mini:
+        cfg['data_cfg'].update(MINI_DATA_CFG)
     seed = cfg['env_setting']['seed']
     num_gpus = cfg['env_setting']['num_gpus']
     available_gpus = torch.cuda.device_count()
@@ -494,6 +517,11 @@ def main():
     initialize_seed(seed)
     args.exp_path = os.path.join(args.exp_folder, args.exp_name)
     build_env(args.config, 'config.yaml', args.exp_path)
+    if args.mini:
+        resolved_config_path = os.path.join(args.exp_path, 'config.yaml')
+        with open(resolved_config_path, 'w', encoding='utf-8') as config_file:
+            yaml.safe_dump(cfg, config_file, sort_keys=False, allow_unicode=True)
+        print('Mini dataset mode enabled.')
 
     if torch.cuda.is_available():
         num_available_gpus = torch.cuda.device_count()
