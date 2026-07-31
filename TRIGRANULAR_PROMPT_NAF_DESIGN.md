@@ -217,6 +217,18 @@ model-only peak-memory test and a real one-step training smoke test are therefor
 mandatory before launch. Existing full-data jobs must not be stopped to make
 the new run fit.
 
+Linux verification completed on the shared RTX 4090 while both existing
+full-data jobs remained active:
+
+- full-resolution model forward/backward: `0.831 s`;
+- peak model allocation: `5.132 GiB`;
+- peak model reservation: `5.309 GiB`;
+- one real mini training batch, including discriminator, ISTFT, PESQ, original
+  losses, and noise-profile loss: passed in `3.289 s`;
+- initial generator/profile loss: `1.248 / 0.439`;
+- initial prompt entropy: `1.758` (`ln(6) = 1.792`), showing no initial prompt
+  collapse.
+
 ## 10. Experimental controls
 
 Branch:
@@ -225,7 +237,7 @@ Branch:
 codex/exp-trigranular-prompt-naf
 ```
 
-Planned mini run:
+Launched mini run:
 
 ```
 experiment: trigranular_prompt_naf_mini_v1
