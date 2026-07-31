@@ -281,13 +281,44 @@ def train(rank, args, cfg):
             _, _, rec_com = mag_phase_stft(audio_g, n_fft, hop_size, win_size, compress_factor, addeps=True)
             loss_con = F.mse_loss(com_g, rec_com) * 2
 
+            # Supervise the prompt estimator with observable degradation
+            # statistics. Clean speech is needed only for this training target.
+            generator_core = generator.module if hasattr(generator, 'module') else generator
+            prompt_aux = generator_core.latest_aux
+            noisy_com = torch.stack(
+                [noisy_mag * torch.cos(noisy_pha), noisy_mag * torch.sin(noisy_pha)],
+                dim=-1
+            )
+            noise_energy = (noisy_com - clean_com).square().sum(dim=-1)
+            mixture_energy = noisy_mag.square()
+            profile_eps = 1e-6
+            profile_min = cfg['model_cfg'].get('noise_profile_log_min', -6.0)
+            profile_max = cfg['model_cfg'].get('noise_profile_log_max', 3.0)
+            temporal_target = (
+                torch.log(noise_energy.mean(dim=1) + profile_eps)
+                - torch.log(mixture_energy.mean(dim=1) + profile_eps)
+            ).clamp(profile_min, profile_max)
+            spectral_target = (
+                torch.log(noise_energy.mean(dim=2) + profile_eps)
+                - torch.log(mixture_energy.mean(dim=2) + profile_eps)
+            ).clamp(profile_min, profile_max)
+            loss_noise_profile = 0.5 * (
+                F.smooth_l1_loss(
+                    prompt_aux['temporal_noise_log_ratio'], temporal_target
+                )
+                + F.smooth_l1_loss(
+                    prompt_aux['spectral_noise_log_ratio'], spectral_target
+                )
+            )
+
             loss_gen_all = (
                 loss_metric * cfg['training_cfg']['loss']['metric'] +
                 loss_mag * cfg['training_cfg']['loss']['magnitude'] +
                 loss_pha * cfg['training_cfg']['loss']['phase'] +
                 loss_com * cfg['training_cfg']['loss']['complex'] +
                 loss_time * cfg['training_cfg']['loss']['time'] + 
-                loss_con * cfg['training_cfg']['loss']['consistancy']
+                loss_con * cfg['training_cfg']['loss']['consistancy'] +
+                loss_noise_profile * cfg['training_cfg']['loss'].get('noise_profile', 0.0)
             )
 
             loss_gen_all.backward()
@@ -311,11 +342,16 @@ def train(rank, args, cfg):
                         com_error = F.mse_loss(clean_com, com_g).item()
                         time_error = F.l1_loss(clean_audio, audio_g).item()
                         con_error = F.mse_loss( com_g, rec_com ).item()
+                        profile_error = loss_noise_profile.item()
+                        prompt_entropy = prompt_aux['prompt_entropy'].item()
 
                         print(
                             'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
-                            'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
-                                steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
+                            'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, '
+                            'Cons Loss: {:4.3f}, Profile Loss: {:4.3f}, Prompt H: {:4.3f}, s/b : {:4.3f}'.format(
+                                steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error,
+                                com_error, time_error, con_error, profile_error, prompt_entropy,
+                                time.time() - start_b
                             ), flush=True
                         )
 
@@ -350,6 +386,8 @@ def train(rank, args, cfg):
                     sw.add_scalar("Training/Complex Loss", com_error, steps)
                     sw.add_scalar("Training/Time Loss", time_error, steps)
                     sw.add_scalar("Training/Consistancy Loss", con_error, steps)
+                    sw.add_scalar("Training/Noise Profile Loss", profile_error, steps)
+                    sw.add_scalar("Training/Prompt Entropy", prompt_entropy, steps)
 
                 # If NaN happend in training period, RaiseError
                 if torch.isnan(loss_gen_all).any():
@@ -480,7 +518,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
     # parser.add_argument('--exp_name', default='Mambavision_emb_08')
-    parser.add_argument('--exp_name', default='main_codex_mask_B')
+    parser.add_argument('--exp_name', default='trigranular_prompt_naf')
     parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
     parser.add_argument('--resume_from', default=None,
                         help='Optional checkpoint directory to load from while saving into exp_folder/exp_name.')

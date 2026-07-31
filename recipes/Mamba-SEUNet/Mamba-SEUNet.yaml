@@ -104,7 +104,7 @@ env_setting:
   summary_interval: 200
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:29501  # URL for initializing distributed training.
+    dist_url: tcp://localhost:29507  # Dedicated port for the prompt-NAF experiment.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
@@ -139,6 +139,7 @@ training_cfg:
     complex: 0.1
     time: 0.2
     consistancy: 0.1
+    noise_profile: 0.03  # Auxiliary supervision for prompt interpretability.
   use_PCS400: False  # Use PCS or not
 
 # STFT Configuration
@@ -152,21 +153,18 @@ stft_cfg:
 # Model Configuration
 # Defines the architecture specifics of the model, including layer configurations and feature compression.
 model_cfg:
-  hid_feature: 16  # Channels in dense layers.
-  dense_channel : 16
   compress_factor: 0.3  # Compression factor applied to extracted features.
-  num_tfmamba: 2  # Number of Time-Frequency Mamba (TFMamba) blocks in the model.
-  d_state: 16 # Dimensionality of the state vector in Mamba blocks.
-  d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
-  expand: 4  # Expansion factor for the layers within the Mamba blocks.
-  norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
   phase_eps: 0.001  # Floor for low-energy phase atan2 to keep backward finite.
-  restoration_width_ratio: 0.5  # Stage-2 width relative to the suppression tower.
-  complex_residual_gate_bias: -2.0  # Start with a conservative residual gate.
-  beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
-  input_channel: 2 # Magnitude and Phase
-  output_channel: 1  # Single Channel Speech Enhancement
-  num_mid_pairs : 3
+  prompt_width: 48  # Base width of the single restoration tower.
+  prompt_count: 6  # Learned degradation bases per prompt granularity.
+  prompt_channels: 64  # Shared prompt-estimator width.
+  prompt_naf_blocks: [2, 2, 6, 2, 2, 2]  # Enc1, enc2, middle, dec2, dec1, refine.
+  axis_kernel_size: 7  # Separate temporal and spectral depthwise filters.
+  prompt_dropout: 0.0
+  residual_limit: 2.0  # Bound relative complex-residual magnitude.
+  residual_floor_ratio: 0.1  # Permit recovery in low-energy mixture bins.
+  noise_profile_log_min: -6.0
+  noise_profile_log_max: 3.0
 
 
 
