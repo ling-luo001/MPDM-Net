@@ -7,8 +7,8 @@ from torchvision.ops.deform_conv import DeformConv2d
 from einops import rearrange
 from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
-from .cross import VSSBlock_Cross_new
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
+from .wavelet_fusion import WaveletSubbandCrossFusion
 import torch.nn.functional as F
 
 
@@ -162,6 +162,14 @@ class MambaSEUNet(nn.Module):
         self.num_mid_pairs = max(1, min(4, self.num_mid_pairs))  # 保证1-4范围
         self.num_mid_stages = self.num_mid_pairs * 2  # 每对包含2次交替，需2个fusion
         # 交叉注意力稀疏/局部窗口配置
+        self.wavelet_mid_levels = int(cfg['model_cfg'].get('wavelet_mid_levels', 2))
+        self.wavelet_final_levels = int(cfg['model_cfg'].get('wavelet_final_levels', 1))
+        self.wavelet_magnitude_update_limit = float(
+            cfg['model_cfg'].get('wavelet_magnitude_update_limit', 1.0)
+        )
+        self.wavelet_phase_update_limit = float(
+            cfg['model_cfg'].get('wavelet_phase_update_limit', 0.5)
+        )
         self.cross_sparse = False
         self.cross_sparse_window = cfg['model_cfg'].get('cross_sparse_window', 64)
         self.cross_global_window = cfg['model_cfg'].get('cross_global_window', 8)
@@ -268,8 +276,15 @@ class MambaSEUNet(nn.Module):
                 nn.GroupNorm(num_groups=1, num_channels=mag_dim[2])
             ) for _ in range(self.num_mid_stages)
         ])
-        # 2) VSS 交互（同维 3H）
-        self.mid_fusions = nn.ModuleList([VSSBlock_Cross_new(hidden_dim=mag_dim[2]) for _ in range(self.num_mid_stages)])
+        # 2) Lossless directional interaction at the aligned 3H width.
+        self.mid_fusions = nn.ModuleList([
+            WaveletSubbandCrossFusion(
+                channels=mag_dim[2],
+                levels=self.wavelet_mid_levels,
+                magnitude_update_limit=self.wavelet_magnitude_update_limit,
+                phase_update_limit=self.wavelet_phase_update_limit,
+            ) for _ in range(self.num_mid_stages)
+        ])
         # 3) 融合后还原各自宽度
         self.mid_fusion_proj_mag = nn.ModuleList([
             nn.Sequential(
@@ -288,7 +303,12 @@ class MambaSEUNet(nn.Module):
             nn.Conv2d(pha_dim[0], mag_dim[0], 1, 1, 0, bias=False),
             nn.GroupNorm(num_groups=1, num_channels=mag_dim[0])
         )
-        self.global_fusion = VSSBlock_Cross_new(hidden_dim=mag_dim[0])
+        self.global_fusion = WaveletSubbandCrossFusion(
+            channels=mag_dim[0],
+            levels=self.wavelet_final_levels,
+            magnitude_update_limit=self.wavelet_magnitude_update_limit,
+            phase_update_limit=self.wavelet_phase_update_limit,
+        )
         self.global_out_proj_pha = nn.Sequential(
             nn.Conv2d(pha_dim[0] + mag_dim[0], pha_dim[0], 1, 1, 0, bias=False),
             nn.GroupNorm(num_groups=1, num_channels=pha_dim[0])
@@ -300,6 +320,15 @@ class MambaSEUNet(nn.Module):
         pha_dec_cfg = deepcopy(cfg)
         pha_dec_cfg['model_cfg']['hid_feature'] = pha_base
         self.phase_decoder = PhaseDecoder(pha_dec_cfg)
+
+    def wavelet_diagnostics(self):
+        """Return bounded update magnitudes without retaining activations."""
+        summaries = [fusion.scale_summary() for fusion in self.mid_fusions]
+        summaries.append(self.global_fusion.scale_summary())
+        return {
+            key: sum(summary[key] for summary in summaries) / len(summaries)
+            for key in ('magnitude', 'phase')
+        }
 
     def forward(self, noisy_mag, noisy_pha):
         if not torch.isfinite(noisy_mag).all():

@@ -177,6 +177,7 @@ def train(rank, args, cfg):
     # scheduler_g, scheduler_d = setup_schedulers((optim_g, optim_d), cfg, last_epoch)
     optim_g, optim_d = optimizers
     scheduler_g, scheduler_d = setup_schedulers(optimizers, cfg, last_epoch)
+    max_grad_norm = cfg['training_cfg'].get('max_grad_norm', 5.0)
 
     # Create trainset and train_loader
     trainset = create_dataset(cfg, train=True, split=True, device=device)
@@ -233,6 +234,12 @@ def train(rank, args, cfg):
             loss_disc_all = loss_disc_r + loss_disc_g
             
             loss_disc_all.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    discriminator.parameters(),
+                    max_grad_norm,
+                    error_if_nonfinite=True
+                )
             optim_d.step()
             # ------------------------------------------------------- #
             
@@ -267,6 +274,12 @@ def train(rank, args, cfg):
             )
 
             loss_gen_all.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    generator.parameters(),
+                    max_grad_norm,
+                    error_if_nonfinite=True
+                )
             optim_g.step()
             # ------------------------------------------------------- #
 
@@ -287,6 +300,24 @@ def train(rank, args, cfg):
                             'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
                                 steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
                             ), flush=True
+                        )
+                        diagnostic_model = generator.module if num_gpus > 1 else generator
+                        wavelet_stats = diagnostic_model.wavelet_diagnostics()
+                        print(
+                            'Wavelet update scales - magnitude: {:.6f}, phase: {:.6f}'.format(
+                                wavelet_stats['magnitude'], wavelet_stats['phase']
+                            ),
+                            flush=True
+                        )
+                        sw.add_scalar(
+                            "Training/Wavelet Magnitude Scale",
+                            wavelet_stats['magnitude'],
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Wavelet Phase Scale",
+                            wavelet_stats['phase'],
+                            steps
                         )
 
                 # Checkpointing

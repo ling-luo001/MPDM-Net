@@ -104,7 +104,7 @@ env_setting:
   summary_interval: 200
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:29501  # URL for initializing distributed training.
+    dist_url: tcp://localhost:13427  # Isolated port for the concurrent 3090 run.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
@@ -124,7 +124,7 @@ data_cfg:
 # This section details parameters that directly influence the training process,
 # including batch sizes, learning rates, and optimizer specifics.
 training_cfg:
-  training_epochs: 400 # Training epoch.
+  training_epochs: 200 # Mini-screening budget.
   batch_size: 2  # Training batch size.
   learning_rate: 0.0009  # Initial learning rate.
   adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
@@ -172,6 +172,10 @@ model_cfg:
   cross_global_window: 8    # 头/尾全局 token
   cross_sparsity: 0.9       # 稀疏率，越大越稀疏
   num_mid_pairs : 3
+  wavelet_mid_levels: 2
+  wavelet_final_levels: 1
+  wavelet_magnitude_update_limit: 1.0
+  wavelet_phase_update_limit: 0.5
 
 
 
