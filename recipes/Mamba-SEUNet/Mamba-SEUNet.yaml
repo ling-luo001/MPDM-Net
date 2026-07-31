@@ -161,6 +161,8 @@ model_cfg:
   prompt_naf_blocks: [2, 2, 6, 2, 2, 2]  # Enc1, enc2, middle, dec2, dec1, refine.
   axis_kernel_size: 7  # Separate temporal and spectral depthwise filters.
   prompt_dropout: 0.0
+  dense_compression: 0.5  # Bottleneck ratio for compressed dense feature reuse.
+  stage_gain_limit: 0.25  # Bound long-stage residual gain to [0.75, 1.25].
   residual_limit: 2.0  # Bound relative complex-residual magnitude.
   residual_floor_ratio: 0.1  # Permit recovery in low-energy mixture bins.
   noise_profile_log_min: -6.0

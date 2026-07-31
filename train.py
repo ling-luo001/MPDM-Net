@@ -344,6 +344,24 @@ def train(rank, args, cfg):
                         con_error = F.mse_loss( com_g, rec_com ).item()
                         profile_error = loss_noise_profile.item()
                         prompt_entropy = prompt_aux['prompt_entropy'].item()
+                        dense_scale = prompt_aux[
+                            'dense_connection_scales'
+                        ].abs().mean().item()
+                        stage_gain = prompt_aux[
+                            'stage_residual_gains'
+                        ].mean().item()
+                        transition_scale = prompt_aux[
+                            'transition_residual_scales'
+                        ].abs().mean().item()
+                        skip_scale = prompt_aux[
+                            'skip_residual_scales'
+                        ].abs().mean().item()
+                        prompt_context_scale = prompt_aux[
+                            'prompt_context_scale'
+                        ].abs().item()
+                        output_dense_scale = prompt_aux[
+                            'output_dense_scale'
+                        ].abs().item()
 
                         print(
                             'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
@@ -353,6 +371,19 @@ def train(rank, args, cfg):
                                 com_error, time_error, con_error, profile_error, prompt_entropy,
                                 time.time() - start_b
                             ), flush=True
+                        )
+                        print(
+                            'Residual-dense diagnostics - Dense: {:4.3f}, Stage gain: {:4.3f}, '
+                            'Transition: {:4.3f}, Skip: {:4.3f}, Prompt context: {:4.3f}, '
+                            'Output bridge: {:4.3f}'.format(
+                                dense_scale,
+                                stage_gain,
+                                transition_scale,
+                                skip_scale,
+                                prompt_context_scale,
+                                output_dense_scale,
+                            ),
+                            flush=True,
                         )
 
                 # Checkpointing
@@ -388,6 +419,12 @@ def train(rank, args, cfg):
                     sw.add_scalar("Training/Consistancy Loss", con_error, steps)
                     sw.add_scalar("Training/Noise Profile Loss", profile_error, steps)
                     sw.add_scalar("Training/Prompt Entropy", prompt_entropy, steps)
+                    sw.add_scalar("Training/Dense Connection Scale", dense_scale, steps)
+                    sw.add_scalar("Training/Stage Residual Gain", stage_gain, steps)
+                    sw.add_scalar("Training/Transition Residual Scale", transition_scale, steps)
+                    sw.add_scalar("Training/Skip Residual Scale", skip_scale, steps)
+                    sw.add_scalar("Training/Prompt Context Scale", prompt_context_scale, steps)
+                    sw.add_scalar("Training/Output Dense Scale", output_dense_scale, steps)
 
                 # If NaN happend in training period, RaiseError
                 if torch.isnan(loss_gen_all).any():
@@ -518,7 +555,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
     # parser.add_argument('--exp_name', default='Mambavision_emb_08')
-    parser.add_argument('--exp_name', default='trigranular_prompt_naf')
+    parser.add_argument('--exp_name', default='trigranular_prompt_naf_resdense')
     parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
     parser.add_argument('--resume_from', default=None,
                         help='Optional checkpoint directory to load from while saving into exp_folder/exp_name.')
