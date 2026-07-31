@@ -173,3 +173,36 @@ The original TriPrompt-NAF remains on its own branch and remote training process
 Rollback is therefore branch-level: use `codex/exp-trigranular-prompt-naf` at
 commit `8519813`. No checkpoint from this branch is compatible by strict state
 dict loading because the structural parameter set is intentionally larger.
+
+## 10. RTX 3090 Deployment Record
+
+- Implementation commit: `6ad02a0`
+- Host GPU: NVIDIA GeForce RTX 3090, 24 GB
+- Python environment: `/home/lz/anaconda3/envs/mamba`
+- PyTorch: `2.4.0+cu118`
+- Remote repository: `/home/lz/PycharmProjects/MPDM-Net-trigranular-resdense`
+- Mini experiment: `trigranular_prompt_naf_resdense_mini_v1`
+- Epoch limit: 200
+- Generator parameters: `3,480,618`
+
+Full-resolution profile with `B=2`, `F=256`, and `T=256`:
+
+- forward and backward elapsed time: `0.756 s`;
+- peak allocated CUDA memory: `7.862 GiB`;
+- peak reserved CUDA memory: `8.154 GiB`;
+- output shape: `(2, 256, 256, 2)`.
+
+All 1,743 mini training pairs and 165 mini validation pairs were present on the
+target host. A two-step real-data smoke run completed the generator,
+discriminator, all losses, backward pass, and optimizer updates.
+
+The first formal validation result was:
+
+- `PESQ 2.5487705714774855 @ 2k`;
+- magnitude loss `0.047872947122563014`;
+- phase loss `2.592063002875357`.
+
+The original TriPrompt-NAF produced `PESQ 2.4257677287766426 @ 2k` on the same
+mini sample lists. The residual-dense version therefore led by approximately
+`0.1230 PESQ` at the first matched checkpoint. This is an early convergence
+signal, not a final model ranking; later matched checkpoints remain required.
