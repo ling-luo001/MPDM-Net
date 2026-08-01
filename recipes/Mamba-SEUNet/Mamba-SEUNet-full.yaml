@@ -111,8 +111,8 @@ env_setting:
 data_cfg:
   train_clean_json: data/train_clean.json
   train_noisy_json: data/train_noisy.json
-  valid_clean_json: data/valid_clean.json
-  valid_noisy_json: data/valid_noisy.json
+  valid_clean_json: data/full_valid_clean.json
+  valid_noisy_json: data/full_valid_noisy.json
   test_clean_json: data/test_clean.json
   test_noisy_json: data/test_noisy.json
 
