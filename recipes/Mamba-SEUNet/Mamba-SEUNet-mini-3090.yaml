@@ -1,0 +1,78 @@
+env_setting:
+  num_gpus: 1
+  num_workers: 4
+  seed: 1234
+  stdout_interval: 200
+  checkpoint_interval: 2000
+  validation_interval: 2000
+  summary_interval: 200
+  dist_cfg:
+    dist_backend: nccl
+    dist_url: tcp://localhost:13557
+    world_size: 1
+
+data_cfg:
+  train_clean_json: data/mini_train_clean_list.json
+  train_noisy_json: data/mini_train_noisy_list.json
+  valid_clean_json: data/mini_val_clean_list.json
+  valid_noisy_json: data/mini_val_noisy_list.json
+  test_clean_json: data/test_clean.json
+  test_noisy_json: data/test_noisy.json
+
+training_cfg:
+  training_epochs: 200
+  batch_size: 2
+  learning_rate: 0.0009
+  adam_b1: 0.8
+  adam_b2: 0.99
+  max_grad_norm: 5.0
+  lr_decay: 0.99
+  segment_size: 30600
+  loss:
+    metric: 0.05
+    magnitude: 0.9
+    phase: 0.3
+    complex: 0.1
+    time: 0.2
+    consistancy: 0.1
+    coarse_complex: 0.1
+    pitch: 0.02
+    voicing: 0.05
+    harmonic_support: 0.01
+  use_PCS400: false
+
+stft_cfg:
+  sampling_rate: 16000
+  n_fft: 510
+  hop_size: 120
+  win_size: 510
+
+model_cfg:
+  hid_feature: 16
+  dense_channel: 16
+  compress_factor: 0.3
+  num_tfmamba: 2
+  d_state: 16
+  d_conv: 4
+  expand: 4
+  norm_epsilon: 0.00001
+  phase_eps: 0.001
+  restoration_width_ratio: 1.0
+  dense_bridge_width_ratio: 0.5
+  local_channel_strip_kernel: 7
+  local_channel_initial_scale: 0.1
+  complex_residual_gate_bias: -2.0
+  deep_filter_offsets: [-2, -1, 1, 2]
+  deep_filter_gate_bias: -2.0
+  pitch_candidates: 64
+  pitch_min_f0: 60.0
+  pitch_max_f0: 500.0
+  pitch_temperature: 0.1
+  pitch_smoothing_bins: 9
+  harmonic_bandwidth_bins: 0.75
+  voicing_gate_bias: -1.0
+  voicing_confidence_power: 0.5
+  beta: 2.0
+  input_channel: 2
+  output_channel: 1
+  num_mid_pairs: 3

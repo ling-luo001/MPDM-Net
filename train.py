@@ -394,6 +394,9 @@ def train(rank, args, cfg):
                         transition_residual_scale = (
                             aux_snapshot['transition_residual_scales'].abs().mean().item()
                         )
+                        local_channel_scale = (
+                            aux_snapshot['local_channel_scales'].abs().mean().item()
+                        )
 
                         print(
                             'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
@@ -409,10 +412,12 @@ def train(rank, args, cfg):
                             'Residual-dense diagnostics - Pitch peak: {:4.3f}, Voicing: {:4.3f}, '
                             'Voice target: {:4.3f}, '
                             'Deep-filter activity: {:4.3f}, Generated activity: {:4.3f}, '
-                            'Dense bridge scale: {:4.3f}, Transition scale: {:4.3f}'.format(
+                            'Dense bridge scale: {:4.3f}, Transition scale: {:4.3f}, '
+                            'Local-channel scale: {:4.3f}'.format(
                                 pitch_peak, voicing_mean, voicing_target_mean,
                                 deep_filter_activity, generated_activity,
-                                dense_bridge_scale, transition_residual_scale
+                                dense_bridge_scale, transition_residual_scale,
+                                local_channel_scale
                             ),
                             flush=True
                         )
@@ -496,6 +501,11 @@ def train(rank, args, cfg):
                     sw.add_scalar(
                         "Training/Transition Residual Scale",
                         aux_snapshot['transition_residual_scales'].abs().mean().item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/Local Channel Scale",
+                        aux_snapshot['local_channel_scales'].abs().mean().item(),
                         steps
                     )
 

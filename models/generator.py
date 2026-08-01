@@ -208,6 +208,68 @@ class ResidualDenseBridge(nn.Module):
         return target + torch.tanh(self.residual_scale) * update
 
 
+class MultiScaleLocalChannelRefiner(nn.Module):
+    """Add local time-frequency detail and lightweight channel selection."""
+
+    def __init__(self, channels, strip_kernel=7, initial_scale=0.1):
+        super().__init__()
+        if strip_kernel < 3 or strip_kernel % 2 == 0:
+            raise ValueError('strip_kernel must be an odd integer >= 3.')
+        if not 0.0 < initial_scale < 1.0:
+            raise ValueError('initial_scale must be in (0, 1).')
+
+        strip_padding = strip_kernel // 2
+        self.pre_norm = nn.GroupNorm(num_groups=1, num_channels=channels)
+        self.input_projection = nn.Conv2d(channels, channels, 1, bias=False)
+        self.local_3x3 = nn.Conv2d(
+            channels, channels, 3, padding=1, groups=channels, bias=False
+        )
+        self.temporal_strip = nn.Conv2d(
+            channels,
+            channels,
+            (strip_kernel, 1),
+            padding=(strip_padding, 0),
+            groups=channels,
+            bias=False,
+        )
+        self.frequency_strip = nn.Conv2d(
+            channels,
+            channels,
+            (1, strip_kernel),
+            padding=(0, strip_padding),
+            groups=channels,
+            bias=False,
+        )
+        self.output_projection = nn.Sequential(
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, 1, bias=False),
+        )
+
+        # ECA-style local cross-channel interaction without channel reduction.
+        self.channel_attention = nn.Conv1d(
+            1, 1, kernel_size=3, padding=1, bias=False
+        )
+        self.residual_scale = nn.Parameter(
+            torch.tensor(math.atanh(float(initial_scale)), dtype=torch.float32)
+        )
+
+    def forward(self, x):
+        projected = self.input_projection(self.pre_norm(x))
+        local = (
+            self.local_3x3(projected)
+            + self.temporal_strip(projected)
+            + self.frequency_strip(projected)
+        ) / math.sqrt(3.0)
+        local = self.output_projection(local)
+
+        channel_descriptor = F.adaptive_avg_pool2d(local, 1)
+        channel_descriptor = channel_descriptor.squeeze(-1).transpose(-1, -2)
+        channel_gate = torch.sigmoid(self.channel_attention(channel_descriptor))
+        channel_gate = channel_gate.transpose(-1, -2).unsqueeze(-1)
+        update = local * channel_gate
+        return x + torch.tanh(self.residual_scale) * update
+
+
 def _make_full_resolution_head(in_channels, out_channels, output_bias=0.0):
     """Decode encoder-resolution features back to the input STFT grid."""
     head = nn.Sequential(
@@ -472,6 +534,49 @@ class MambaSEUNet(nn.Module):
         )
         self.latest_aux = {}
 
+        strip_kernel = int(cfg['model_cfg'].get('local_channel_strip_kernel', 7))
+        initial_scale = float(
+            cfg['model_cfg'].get('local_channel_initial_scale', 0.1)
+        )
+        self.local_channel_refiners = nn.ModuleDict({
+            'mag_encoder_level1': MultiScaleLocalChannelRefiner(
+                mag_dim[0], strip_kernel, initial_scale
+            ),
+            'mag_encoder_level2': MultiScaleLocalChannelRefiner(
+                mag_dim[1], strip_kernel, initial_scale
+            ),
+            'mag_middle': MultiScaleLocalChannelRefiner(
+                mag_dim[2], strip_kernel, initial_scale
+            ),
+            'mag_decoder_level2': MultiScaleLocalChannelRefiner(
+                mag_dim[1], strip_kernel, initial_scale
+            ),
+            'mag_decoder_level1': MultiScaleLocalChannelRefiner(
+                mag_dim[0], strip_kernel, initial_scale
+            ),
+            'mag_refinement': MultiScaleLocalChannelRefiner(
+                mag_dim[0], strip_kernel, initial_scale
+            ),
+            'restore_encoder_level1': MultiScaleLocalChannelRefiner(
+                restore_dim[0], strip_kernel, initial_scale
+            ),
+            'restore_encoder_level2': MultiScaleLocalChannelRefiner(
+                restore_dim[1], strip_kernel, initial_scale
+            ),
+            'restore_middle': MultiScaleLocalChannelRefiner(
+                restore_dim[2], strip_kernel, initial_scale
+            ),
+            'restore_decoder_level2': MultiScaleLocalChannelRefiner(
+                restore_dim[1], strip_kernel, initial_scale
+            ),
+            'restore_decoder_level1': MultiScaleLocalChannelRefiner(
+                restore_dim[0], strip_kernel, initial_scale
+            ),
+            'restore_refinement': MultiScaleLocalChannelRefiner(
+                restore_dim[0], strip_kernel, initial_scale
+            ),
+        })
+
     def _build_harmonic_templates(self):
         n_fft = int(self.cfg['stft_cfg']['n_fft'])
         sample_rate = float(self.cfg['stft_cfg']['sampling_rate'])
@@ -592,6 +697,7 @@ class MambaSEUNet(nn.Module):
         for block in self.mag_TSMamba1_encoder:
             mag_x1 = block(mag_x1)
         mag_x1 = mag_copy1 + mag_x1
+        mag_x1 = self.local_channel_refiners['mag_encoder_level1'](mag_x1)
         mag_skip1 = mag_x1
 
         mag_x2 = self.mag_down1_2(mag_x1)
@@ -600,6 +706,7 @@ class MambaSEUNet(nn.Module):
         for block in self.mag_TSMamba2_encoder:
             mag_x2 = block(mag_x2)
         mag_x2 = mag_copy2 + mag_x2
+        mag_x2 = self.local_channel_refiners['mag_encoder_level2'](mag_x2)
         mag_skip2 = mag_x2
 
         mag_x3 = self.mag_down2_3(mag_x2)
@@ -609,6 +716,8 @@ class MambaSEUNet(nn.Module):
             mag_x3 = fm_block(mag_x3)
             mag_x3 = tm_block(mag_x3)
             suppress_middle_features.append(mag_x3)
+        mag_x3 = self.local_channel_refiners['mag_middle'](mag_x3)
+        suppress_middle_features[-1] = mag_x3
         suppress_bottleneck = mag_x3
 
         # Stage 1 decoder and coarse complex-spectrum reconstruction.
@@ -619,6 +728,7 @@ class MambaSEUNet(nn.Module):
         for block in self.mag_TSMamba2_decoder:
             mag_y2 = block(mag_y2)
         mag_y2 = mag_y2_copy + mag_y2
+        mag_y2 = self.local_channel_refiners['mag_decoder_level2'](mag_y2)
 
         # Decode to the original encoder resolution.
         mag_y1 = self.mag_up2_1(mag_y2)
@@ -628,13 +738,17 @@ class MambaSEUNet(nn.Module):
         for block in self.mag_TSMamba1_decoder:
             mag_y1 = block(mag_y1)
         mag_y1 = mag_y1_copy + mag_y1
+        mag_y1 = self.local_channel_refiners['mag_decoder_level1'](mag_y1)
 
         # Refine Stage 1 features before coarse reconstruction.
         mag_copy_ref = mag_y1
         mag_y1 = self.mag_patch_embed_refinement(mag_y1)
         for block in self.mag_refinement:
             mag_y1 = block(mag_y1)
-        mag_final = self.mag_output(mag_y1 + mag_copy_ref) + mag_skip1
+        mag_refined = self.local_channel_refiners['mag_refinement'](
+            mag_y1 + mag_copy_ref
+        )
+        mag_final = self.mag_output(mag_refined) + mag_skip1
 
         # Coarse signal reconstruction.
         mag_mask = self.mask_decoder(self.mag_to_mask_proj(mag_final))
@@ -726,6 +840,9 @@ class MambaSEUNet(nn.Module):
         for block in self.restore_TMamba1_encoder:
             restore_x1 = block(restore_x1)
         restore_x1 = restore_copy1 + restore_x1
+        restore_x1 = self.local_channel_refiners[
+            'restore_encoder_level1'
+        ](restore_x1)
         restore_x1 = self.dense_bridges['encoder_level1'](
             restore_x1, mag_skip1, mag_y1, mag_final
         )
@@ -737,6 +854,9 @@ class MambaSEUNet(nn.Module):
         for block in self.restore_TMamba2_encoder:
             restore_x2 = block(restore_x2)
         restore_x2 = restore_copy2 + restore_x2
+        restore_x2 = self.local_channel_refiners[
+            'restore_encoder_level2'
+        ](restore_x2)
         restore_x2 = self.dense_bridges['encoder_level2'](
             restore_x2, mag_skip2, mag_y2
         )
@@ -758,6 +878,7 @@ class MambaSEUNet(nn.Module):
         for tm_block, fm_block in zip(self.restore_TM_middle, self.restore_FM_middle):
             restore_x3 = tm_block(restore_x3)
             restore_x3 = fm_block(restore_x3)
+        restore_x3 = self.local_channel_refiners['restore_middle'](restore_x3)
 
         restore_y2 = self.restore_up3_2(restore_x3)
         restore_y2 = self.restore_concat_level2(
@@ -768,6 +889,9 @@ class MambaSEUNet(nn.Module):
         for block in self.restore_TMamba2_decoder:
             restore_y2 = block(restore_y2)
         restore_y2 = restore_y2_copy + restore_y2
+        restore_y2 = self.local_channel_refiners[
+            'restore_decoder_level2'
+        ](restore_y2)
         restore_y2 = self.dense_bridges['decoder_level2'](
             restore_y2, mag_skip2, mag_y2
         )
@@ -781,6 +905,9 @@ class MambaSEUNet(nn.Module):
         for block in self.restore_TMamba1_decoder:
             restore_y1 = block(restore_y1)
         restore_y1 = restore_y1_copy + restore_y1
+        restore_y1 = self.local_channel_refiners[
+            'restore_decoder_level1'
+        ](restore_y1)
         restore_y1 = self.dense_bridges['decoder_level1'](
             restore_y1, mag_skip1, mag_y1, mag_final
         )
@@ -789,7 +916,10 @@ class MambaSEUNet(nn.Module):
         restore_y1 = self.restore_patch_embed_refinement(restore_y1)
         for block in self.restore_refinement:
             restore_y1 = block(restore_y1)
-        restore_final = self.restore_output(restore_y1 + restore_copy_ref) + restore_skip1
+        restore_y1 = self.local_channel_refiners['restore_refinement'](
+            restore_y1 + restore_copy_ref
+        )
+        restore_final = self.restore_output(restore_y1) + restore_skip1
         restore_final = self.dense_bridges['output'](restore_final, mag_final)
 
         harmonic_residual = torch.tanh(
@@ -876,6 +1006,10 @@ class MambaSEUNet(nn.Module):
                 self.restore_up2_1,
             )
         ])
+        local_channel_scales = torch.stack([
+            torch.tanh(refiner.residual_scale)
+            for refiner in self.local_channel_refiners.values()
+        ])
         self.latest_aux = {
             'coarse_complex': torch.stack((coarse_real, coarse_imag), dim=-1),
             'deep_filter_coefficients': deep_filter_coefficients,
@@ -898,5 +1032,6 @@ class MambaSEUNet(nn.Module):
             'suppression_context_scale': context_scale,
             'dense_bridge_scales': dense_bridge_scales,
             'transition_residual_scales': transition_residual_scales,
+            'local_channel_scales': local_channel_scales,
         }
         return denoised_mag, pred_pha, denoised_com

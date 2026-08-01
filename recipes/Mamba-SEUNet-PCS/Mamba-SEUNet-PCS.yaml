@@ -67,6 +67,8 @@ model_cfg:
   norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
   restoration_width_ratio: 1.0  # Full-capacity conditional restoration tower.
   dense_bridge_width_ratio: 0.5
+  local_channel_strip_kernel: 7
+  local_channel_initial_scale: 0.1
   complex_residual_gate_bias: -2.0
   deep_filter_offsets: [-2, -1, 1, 2]
   deep_filter_gate_bias: -2.0

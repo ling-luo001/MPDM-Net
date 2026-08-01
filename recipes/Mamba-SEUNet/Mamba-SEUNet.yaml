@@ -167,6 +167,8 @@ model_cfg:
   phase_eps: 0.001  # Floor for low-energy phase atan2 to keep backward finite.
   restoration_width_ratio: 1.0  # Full-capacity conditional restoration tower.
   dense_bridge_width_ratio: 0.5  # Bottleneck width inside cross-stage dense bridges.
+  local_channel_strip_kernel: 7  # Axis-aware local receptive field after each Mamba stage.
+  local_channel_initial_scale: 0.1  # Stable but immediately trainable residual update.
   complex_residual_gate_bias: -2.0  # Start with a conservative residual gate.
   deep_filter_offsets: [-2, -1, 1, 2]  # Neighboring complex-filter frames.
   deep_filter_gate_bias: -2.0
