@@ -3,6 +3,8 @@ import unittest
 import torch
 
 from models.wavelet_fusion import (
+    DirectionalSubbandExchange,
+    ResidualDenseDirectionalExchange,
     WaveletSubbandCrossFusion,
     haar_dwt2,
     haar_idwt2,
@@ -57,6 +59,44 @@ class WaveletSubbandCrossFusionTest(unittest.TestCase):
                 for parameter in module.parameters()
             )
         )
+
+    def test_dense_context_update_has_finite_gradients(self):
+        module = ResidualDenseDirectionalExchange(
+            channels=4,
+            kernel_size=(5, 1),
+            dense_depth=3,
+        )
+        module.dense_adapter.raw_magnitude_scale.data.fill_(0.1)
+        module.dense_adapter.raw_phase_scale.data.fill_(0.1)
+        magnitude = torch.randn(2, 4, 9, 7, requires_grad=True)
+        phase = torch.randn(2, 4, 9, 7, requires_grad=True)
+        context_magnitude = torch.randn(2, 4, 9, 7, requires_grad=True)
+        context_phase = torch.randn(2, 4, 9, 7, requires_grad=True)
+        enhanced_magnitude, enhanced_phase = module(
+            magnitude,
+            phase,
+            context_magnitude,
+            context_phase,
+        )
+        loss = enhanced_magnitude.square().mean() + enhanced_phase.square().mean()
+        loss.backward()
+        for tensor in (magnitude, phase, context_magnitude, context_phase):
+            self.assertTrue(torch.isfinite(tensor.grad).all())
+
+    def test_dense_adapter_preserves_baseline_rng_sequence(self):
+        torch.manual_seed(19)
+        baseline = DirectionalSubbandExchange(4, (3, 3))
+        baseline_next_random = torch.rand(8)
+
+        torch.manual_seed(19)
+        optimized = ResidualDenseDirectionalExchange(4, (3, 3))
+        optimized_next_random = torch.rand(8)
+
+        for key, value in baseline.state_dict().items():
+            self.assertTrue(
+                torch.equal(value, optimized.base_exchange.state_dict()[key])
+            )
+        self.assertTrue(torch.equal(baseline_next_random, optimized_next_random))
 
 
 if __name__ == "__main__":

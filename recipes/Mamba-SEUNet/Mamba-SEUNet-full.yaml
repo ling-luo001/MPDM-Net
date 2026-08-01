@@ -172,6 +172,10 @@ model_cfg:
   wavelet_final_levels: 1
   wavelet_magnitude_update_limit: 1.0
   wavelet_phase_update_limit: 0.5
+  wavelet_dense_depth: 3
+  wavelet_dense_width_ratio: 0.5
+  wavelet_dense_magnitude_update_limit: 0.5
+  wavelet_dense_phase_update_limit: 0.25
 
 
 

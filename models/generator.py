@@ -125,9 +125,17 @@ class Downsample(nn.Module):
             # pw-linear
             nn.Conv2d(input_feat, out_feat // 4, 1, 1, 0, bias=False),
             nn.PixelUnshuffle(2))
+        rng_state = torch.random.get_rng_state()
+        self.shortcut = nn.Sequential(
+            nn.PixelUnshuffle(2),
+            nn.Conv2d(input_feat * 4, out_feat, 1, 1, 0, bias=False),
+            nn.GroupNorm(num_groups=1, num_channels=out_feat),
+        )
+        torch.random.set_rng_state(rng_state)
+        self.residual_scale = nn.Parameter(torch.zeros(()))
 
     def forward(self, x):
-        return self.body(x)
+        return self.body(x) + torch.tanh(self.residual_scale) * self.shortcut(x)
 
 
 class Upsample(nn.Module):
@@ -140,9 +148,17 @@ class Upsample(nn.Module):
             # pw-linear
             nn.Conv2d(input_feat, out_feat * 4, 1, 1, 0, bias=False),
             nn.PixelShuffle(2))
+        rng_state = torch.random.get_rng_state()
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(input_feat, out_feat * 4, 1, 1, 0, bias=False),
+            nn.PixelShuffle(2),
+            nn.GroupNorm(num_groups=1, num_channels=out_feat),
+        )
+        torch.random.set_rng_state(rng_state)
+        self.residual_scale = nn.Parameter(torch.zeros(()))
 
     def forward(self, x):
-        return self.body(x)
+        return self.body(x) + torch.tanh(self.residual_scale) * self.shortcut(x)
 
 
 class MambaSEUNet(nn.Module):
@@ -170,6 +186,22 @@ class MambaSEUNet(nn.Module):
         self.wavelet_phase_update_limit = float(
             cfg['model_cfg'].get('wavelet_phase_update_limit', 0.5)
         )
+        self.wavelet_dense_depth = int(
+            cfg['model_cfg'].get('wavelet_dense_depth', 3)
+        )
+        self.wavelet_dense_width_ratio = float(
+            cfg['model_cfg'].get('wavelet_dense_width_ratio', 0.5)
+        )
+        self.wavelet_dense_magnitude_update_limit = float(
+            cfg['model_cfg'].get('wavelet_dense_magnitude_update_limit', 0.5)
+        )
+        self.wavelet_dense_phase_update_limit = float(
+            cfg['model_cfg'].get('wavelet_dense_phase_update_limit', 0.25)
+        )
+        if self.wavelet_dense_depth < 1:
+            raise ValueError('wavelet_dense_depth must be at least one')
+        if not 0.0 < self.wavelet_dense_width_ratio <= 2.0:
+            raise ValueError('wavelet_dense_width_ratio must be in (0, 2]')
         self.cross_sparse = False
         self.cross_sparse_window = cfg['model_cfg'].get('cross_sparse_window', 64)
         self.cross_global_window = cfg['model_cfg'].get('cross_global_window', 8)
@@ -283,6 +315,12 @@ class MambaSEUNet(nn.Module):
                 levels=self.wavelet_mid_levels,
                 magnitude_update_limit=self.wavelet_magnitude_update_limit,
                 phase_update_limit=self.wavelet_phase_update_limit,
+                dense_depth=self.wavelet_dense_depth,
+                dense_width_ratio=self.wavelet_dense_width_ratio,
+                dense_magnitude_update_limit=(
+                    self.wavelet_dense_magnitude_update_limit
+                ),
+                dense_phase_update_limit=self.wavelet_dense_phase_update_limit,
             ) for _ in range(self.num_mid_stages)
         ])
         # 3) 融合后还原各自宽度
@@ -308,6 +346,12 @@ class MambaSEUNet(nn.Module):
             levels=self.wavelet_final_levels,
             magnitude_update_limit=self.wavelet_magnitude_update_limit,
             phase_update_limit=self.wavelet_phase_update_limit,
+            dense_depth=self.wavelet_dense_depth,
+            dense_width_ratio=self.wavelet_dense_width_ratio,
+            dense_magnitude_update_limit=(
+                self.wavelet_dense_magnitude_update_limit
+            ),
+            dense_phase_update_limit=self.wavelet_dense_phase_update_limit,
         )
         self.global_out_proj_pha = nn.Sequential(
             nn.Conv2d(pha_dim[0] + mag_dim[0], pha_dim[0], 1, 1, 0, bias=False),
@@ -325,10 +369,25 @@ class MambaSEUNet(nn.Module):
         """Return bounded update magnitudes without retaining activations."""
         summaries = [fusion.scale_summary() for fusion in self.mid_fusions]
         summaries.append(self.global_fusion.scale_summary())
-        return {
+        diagnostics = {
             key: sum(summary[key] for summary in summaries) / len(summaries)
-            for key in ('magnitude', 'phase')
+            for key in summaries[0]
         }
+        transition_modules = (
+            self.mag_down1_2,
+            self.mag_down2_3,
+            self.mag_up3_2,
+            self.mag_up2_1,
+            self.pha_down1_2,
+            self.pha_down2_3,
+            self.pha_up3_2,
+            self.pha_up2_1,
+        )
+        diagnostics['transition_residual'] = sum(
+            torch.tanh(module.residual_scale).detach().abs().item()
+            for module in transition_modules
+        ) / len(transition_modules)
+        return diagnostics
 
     def forward(self, noisy_mag, noisy_pha):
         if not torch.isfinite(noisy_mag).all():

@@ -104,15 +104,15 @@ env_setting:
   summary_interval: 200
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:13427  # Isolated port for the concurrent 3090 run.
+    dist_url: tcp://localhost:13447  # Isolated port for the concurrent 4090 mini run.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
 data_cfg:
-  train_clean_json: data/mini_train_clean_list.json
-  train_noisy_json: data/mini_train_noisy_list.json
-  valid_clean_json: data/mini_val_clean_list.json
-  valid_noisy_json: data/mini_val_noisy_list.json
+  train_clean_json: data/mini_4090_train_clean_list.json
+  train_noisy_json: data/mini_4090_train_noisy_list.json
+  valid_clean_json: data/mini_4090_val_clean_list.json
+  valid_noisy_json: data/mini_4090_val_noisy_list.json
 #  train_clean_json: data/train_clean.json
 #  train_noisy_json: data/train_noisy.json
 #  valid_clean_json: data/valid_clean.json

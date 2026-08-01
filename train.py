@@ -309,6 +309,15 @@ def train(rank, args, cfg):
                             ),
                             flush=True
                         )
+                        print(
+                            'Residual-dense scales - magnitude: {:.6f}, phase: {:.6f}, '
+                            'transition: {:.6f}'.format(
+                                wavelet_stats['dense_magnitude'],
+                                wavelet_stats['dense_phase'],
+                                wavelet_stats['transition_residual'],
+                            ),
+                            flush=True
+                        )
                         sw.add_scalar(
                             "Training/Wavelet Magnitude Scale",
                             wavelet_stats['magnitude'],
@@ -317,6 +326,21 @@ def train(rank, args, cfg):
                         sw.add_scalar(
                             "Training/Wavelet Phase Scale",
                             wavelet_stats['phase'],
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Residual Dense Magnitude Scale",
+                            wavelet_stats['dense_magnitude'],
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Residual Dense Phase Scale",
+                            wavelet_stats['dense_phase'],
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Transition Residual Scale",
+                            wavelet_stats['transition_residual'],
                             steps
                         )
 
