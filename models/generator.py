@@ -209,14 +209,22 @@ class ResidualDenseBridge(nn.Module):
 
 
 class MultiScaleLocalChannelRefiner(nn.Module):
-    """Add local time-frequency detail and lightweight channel selection."""
+    """Refine local TF detail with stable intra-module residual reuse."""
 
-    def __init__(self, channels, strip_kernel=7, initial_scale=0.1):
+    def __init__(
+        self,
+        channels,
+        strip_kernel=7,
+        initial_scale=0.05,
+        dense_initial_scale=0.0,
+    ):
         super().__init__()
         if strip_kernel < 3 or strip_kernel % 2 == 0:
             raise ValueError('strip_kernel must be an odd integer >= 3.')
         if not 0.0 < initial_scale < 1.0:
             raise ValueError('initial_scale must be in (0, 1).')
+        if not -1.0 < dense_initial_scale < 1.0:
+            raise ValueError('dense_initial_scale must be in (-1, 1).')
 
         strip_padding = strip_kernel // 2
         self.pre_norm = nn.GroupNorm(num_groups=1, num_channels=channels)
@@ -249,25 +257,63 @@ class MultiScaleLocalChannelRefiner(nn.Module):
         self.channel_attention = nn.Conv1d(
             1, 1, kernel_size=3, padding=1, bias=False
         )
+        # Keep the original Conv1d construction (and RNG consumption), then
+        # center the channel gain at exactly one for a neutral initialization.
+        nn.init.zeros_(self.channel_attention.weight)
         self.residual_scale = nn.Parameter(
             torch.tensor(math.atanh(float(initial_scale)), dtype=torch.float32)
         )
+        dense_parameter = math.atanh(float(dense_initial_scale))
+        self.dense_residual_scales = nn.Parameter(
+            torch.full((3,), dense_parameter, dtype=torch.float32)
+        )
+        self.branch_logits = nn.Parameter(torch.zeros(3, dtype=torch.float32))
+        self.latest_diagnostics = {}
+
+    def _compute_branches(self, projected):
+        dense_scales = torch.tanh(self.dense_residual_scales)
+        local_3x3 = self.local_3x3(projected)
+        temporal = self.temporal_strip(
+            projected + dense_scales[0] * local_3x3
+        )
+        frequency = self.frequency_strip(
+            projected
+            + dense_scales[1] * local_3x3
+            + dense_scales[2] * temporal
+        )
+        return local_3x3, temporal, frequency
+
+    def _branch_weights(self):
+        return math.sqrt(3.0) * torch.softmax(self.branch_logits, dim=0)
+
+    def _channel_gain(self, update):
+        channel_descriptor = F.adaptive_avg_pool2d(update, 1)
+        channel_descriptor = channel_descriptor.squeeze(-1).transpose(-1, -2)
+        gain = 2.0 * torch.sigmoid(self.channel_attention(channel_descriptor))
+        return gain.transpose(-1, -2).unsqueeze(-1)
 
     def forward(self, x):
         projected = self.input_projection(self.pre_norm(x))
-        local = (
-            self.local_3x3(projected)
-            + self.temporal_strip(projected)
-            + self.frequency_strip(projected)
-        ) / math.sqrt(3.0)
-        local = self.output_projection(local)
+        branches = self._compute_branches(projected)
+        branch_weights = self._branch_weights()
+        local = sum(
+            weight * branch for weight, branch in zip(branch_weights, branches)
+        )
+        update = self.output_projection(local)
+        channel_gain = self._channel_gain(update)
+        applied_update = torch.tanh(self.residual_scale) * update * channel_gain
 
-        channel_descriptor = F.adaptive_avg_pool2d(local, 1)
-        channel_descriptor = channel_descriptor.squeeze(-1).transpose(-1, -2)
-        channel_gate = torch.sigmoid(self.channel_attention(channel_descriptor))
-        channel_gate = channel_gate.transpose(-1, -2).unsqueeze(-1)
-        update = local * channel_gate
-        return x + torch.tanh(self.residual_scale) * update
+        with torch.no_grad():
+            input_rms = x.detach().float().square().mean().sqrt().clamp_min(1e-8)
+            update_rms = applied_update.detach().float().square().mean().sqrt()
+            self.latest_diagnostics = {
+                'dense_scales': torch.tanh(self.dense_residual_scales).detach(),
+                'branch_weights': branch_weights.detach(),
+                'channel_gain_mean': channel_gain.detach().float().mean(),
+                'update_ratio': update_rms / input_rms,
+            }
+
+        return x + applied_update
 
 
 def _make_full_resolution_head(in_channels, out_channels, output_bias=0.0):
@@ -536,44 +582,47 @@ class MambaSEUNet(nn.Module):
 
         strip_kernel = int(cfg['model_cfg'].get('local_channel_strip_kernel', 7))
         initial_scale = float(
-            cfg['model_cfg'].get('local_channel_initial_scale', 0.1)
+            cfg['model_cfg'].get('local_channel_initial_scale', 0.05)
+        )
+        dense_initial_scale = float(
+            cfg['model_cfg'].get('local_channel_dense_initial_scale', 0.0)
         )
         self.local_channel_refiners = nn.ModuleDict({
             'mag_encoder_level1': MultiScaleLocalChannelRefiner(
-                mag_dim[0], strip_kernel, initial_scale
+                mag_dim[0], strip_kernel, initial_scale, dense_initial_scale
             ),
             'mag_encoder_level2': MultiScaleLocalChannelRefiner(
-                mag_dim[1], strip_kernel, initial_scale
+                mag_dim[1], strip_kernel, initial_scale, dense_initial_scale
             ),
             'mag_middle': MultiScaleLocalChannelRefiner(
-                mag_dim[2], strip_kernel, initial_scale
+                mag_dim[2], strip_kernel, initial_scale, dense_initial_scale
             ),
             'mag_decoder_level2': MultiScaleLocalChannelRefiner(
-                mag_dim[1], strip_kernel, initial_scale
+                mag_dim[1], strip_kernel, initial_scale, dense_initial_scale
             ),
             'mag_decoder_level1': MultiScaleLocalChannelRefiner(
-                mag_dim[0], strip_kernel, initial_scale
+                mag_dim[0], strip_kernel, initial_scale, dense_initial_scale
             ),
             'mag_refinement': MultiScaleLocalChannelRefiner(
-                mag_dim[0], strip_kernel, initial_scale
+                mag_dim[0], strip_kernel, initial_scale, dense_initial_scale
             ),
             'restore_encoder_level1': MultiScaleLocalChannelRefiner(
-                restore_dim[0], strip_kernel, initial_scale
+                restore_dim[0], strip_kernel, initial_scale, dense_initial_scale
             ),
             'restore_encoder_level2': MultiScaleLocalChannelRefiner(
-                restore_dim[1], strip_kernel, initial_scale
+                restore_dim[1], strip_kernel, initial_scale, dense_initial_scale
             ),
             'restore_middle': MultiScaleLocalChannelRefiner(
-                restore_dim[2], strip_kernel, initial_scale
+                restore_dim[2], strip_kernel, initial_scale, dense_initial_scale
             ),
             'restore_decoder_level2': MultiScaleLocalChannelRefiner(
-                restore_dim[1], strip_kernel, initial_scale
+                restore_dim[1], strip_kernel, initial_scale, dense_initial_scale
             ),
             'restore_decoder_level1': MultiScaleLocalChannelRefiner(
-                restore_dim[0], strip_kernel, initial_scale
+                restore_dim[0], strip_kernel, initial_scale, dense_initial_scale
             ),
             'restore_refinement': MultiScaleLocalChannelRefiner(
-                restore_dim[0], strip_kernel, initial_scale
+                restore_dim[0], strip_kernel, initial_scale, dense_initial_scale
             ),
         })
 
@@ -1009,7 +1058,25 @@ class MambaSEUNet(nn.Module):
         local_channel_scales = torch.stack([
             torch.tanh(refiner.residual_scale)
             for refiner in self.local_channel_refiners.values()
+        ]).detach()
+        local_channel_dense_scales = torch.stack([
+            refiner.latest_diagnostics['dense_scales']
+            for refiner in self.local_channel_refiners.values()
         ])
+        local_channel_branch_weights = torch.stack([
+            refiner.latest_diagnostics['branch_weights']
+            for refiner in self.local_channel_refiners.values()
+        ])
+        local_channel_channel_gain = torch.stack([
+            refiner.latest_diagnostics['channel_gain_mean']
+            for refiner in self.local_channel_refiners.values()
+        ])
+        local_channel_update_ratio = torch.stack([
+            refiner.latest_diagnostics['update_ratio']
+            for refiner in self.local_channel_refiners.values()
+        ])
+        suppression_slice = slice(0, 6)
+        restoration_slice = slice(6, 12)
         self.latest_aux = {
             'coarse_complex': torch.stack((coarse_real, coarse_imag), dim=-1),
             'deep_filter_coefficients': deep_filter_coefficients,
@@ -1033,5 +1100,21 @@ class MambaSEUNet(nn.Module):
             'dense_bridge_scales': dense_bridge_scales,
             'transition_residual_scales': transition_residual_scales,
             'local_channel_scales': local_channel_scales,
+            'local_channel_dense_scales': local_channel_dense_scales,
+            'local_channel_branch_weights': local_channel_branch_weights,
+            'local_channel_channel_gain': local_channel_channel_gain,
+            'local_channel_update_ratio': local_channel_update_ratio,
+            'local_channel_suppression_scale_mean': (
+                local_channel_scales[suppression_slice].abs().mean()
+            ),
+            'local_channel_restoration_scale_mean': (
+                local_channel_scales[restoration_slice].abs().mean()
+            ),
+            'local_channel_suppression_update_ratio_mean': (
+                local_channel_update_ratio[suppression_slice].mean()
+            ),
+            'local_channel_restoration_update_ratio_mean': (
+                local_channel_update_ratio[restoration_slice].mean()
+            ),
         }
         return denoised_mag, pred_pha, denoised_com

@@ -8,7 +8,7 @@ env_setting:
   summary_interval: 200
   dist_cfg:
     dist_backend: nccl
-    dist_url: tcp://localhost:13557
+    dist_url: tcp://localhost:29509  # Dedicated port for stabilized TF-LCA mini.
     world_size: 1
 
 data_cfg:
@@ -60,7 +60,8 @@ model_cfg:
   restoration_width_ratio: 1.0
   dense_bridge_width_ratio: 0.5
   local_channel_strip_kernel: 7
-  local_channel_initial_scale: 0.1
+  local_channel_initial_scale: 0.05
+  local_channel_dense_initial_scale: 0.0
   complex_residual_gate_bias: -2.0
   deep_filter_offsets: [-2, -1, 1, 2]
   deep_filter_gate_bias: -2.0

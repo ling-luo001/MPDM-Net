@@ -4,7 +4,8 @@
 
 - Base branch: `codex/exp-hierarchical-residual-dense`
 - Base commit: `404c982985a29b382ee45bade8e483da6ae446ea`
-- Experiment branch: `codex/exp-multiscale-local-channel`
+- Parent experiment: `codex/exp-multiscale-local-channel` at `d7348b1`
+- Stabilized experiment branch: `codex/exp-multiscale-local-channel-stabilized`
 - Primary comparison: residual-dense mini under the same data, optimizer, and seed
 
 ## Motivation
@@ -30,13 +31,25 @@ The design is informed by three established observations:
 
 ## Module
 
-`MultiScaleLocalChannelRefiner` performs:
+The stabilized `MultiScaleLocalChannelRefiner` performs:
 
 1. Group normalization and a point-wise channel projection.
-2. Parallel depth-wise `3x3`, `7x1`, and `1x7` convolutions.
-3. Variance-preserving branch aggregation and a point-wise output projection.
-4. ECA-style channel attention without channel reduction.
-5. A learnable residual connection initialized to an effective scale of `0.1`.
+2. A depth-wise `3x3` branch, followed by zero-start reuse into the `7x1`
+   temporal branch and both branches into the `1x7` frequency branch.
+3. Learnable branch weights initialized to `1/sqrt(3)` per branch, exactly
+   preserving the original variance-scaled aggregation at step zero.
+4. SiLU and the existing point-wise output projection.
+5. ECA-style channel attention expressed as `2 * sigmoid(.)`; its convolution
+   starts at zero so the channel gain is exactly one.
+6. A bounded residual update initialized to `0.05`, matching the original
+   approximate effective update of `0.1 * 0.5` without forcing the outer scale
+   to compensate for a half-open channel gate.
+
+The three internal reuse scales start at zero. This keeps the initial local
+branches equivalent to the original parallel TF-LCA while allowing the
+temporal and frequency paths to learn residual reuse. Only six scalar
+parameters are added per adapter: three dense scales and three branch logits.
+Across 12 adapters this is 72 parameters, below the 128-parameter limit.
 
 The strip branches have explicit speech roles: `7x1` captures short temporal
 continuity and `1x7` captures local spectral/formant structure. The residual
@@ -66,6 +79,7 @@ The following remain unchanged from the residual-dense baseline:
 - suppression/restoration topology
 - harmonic analysis and deep filtering
 - residual-dense bridges and transition shortcuts
+- all 12 TF-LCA insertion positions
 - generator/discriminator losses
 - mini train/validation lists
 - batch size, learning rate, seed, and validation interval
@@ -85,7 +99,27 @@ than the residual-dense mini comparison without instability.
 
 ## Diagnostics
 
-The mean absolute effective adapter scale is stored in
-`generator.latest_aux['local_channel_scales']` and logged to stdout and
-TensorBoard. This distinguishes a failed optimization path from a module that
-is active but not useful.
+All TF-LCA diagnostics are detached before entering `generator.latest_aux`:
+
+- `local_channel_scales`: effective outer residual scale for all 12 adapters
+- `local_channel_dense_scales`: three internal reuse scales per adapter
+- `local_channel_branch_weights`: `3x3`, temporal, and frequency weights
+- `local_channel_channel_gain`: mean centered channel gain per adapter
+- `local_channel_update_ratio`: RMS of the applied update divided by input RMS
+- suppression/restoration means for the outer scale and update ratio
+
+The same compact summaries are logged to stdout and TensorBoard. They separate
+optimization instability from a model that learns to reject a branch or an
+entire tower's local update.
+
+## Stability Risks
+
+- The original experiment's outer scale reached about `0.57`; that may reflect
+  useful strong local correction rather than compensation for the old gate.
+- Dense reuse can blur the intended temporal/frequency specialization.
+- Branch weights are not regularized toward equality. If one branch collapses,
+  PESQ and update-ratio evidence must decide whether that is useful selection
+  or a failed optimization path.
+- No extra cross-stage residual or dense bridge is added because the inherited
+  `404c982` model already contains six residual-dense bridges and eight
+  transition shortcuts.

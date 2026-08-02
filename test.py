@@ -43,6 +43,11 @@ def main():
     assert aux['restoration_gate'].shape == (batch_size, 2, frames, freq_bins)
     assert aux['dense_bridge_scales'].shape == (6,)
     assert aux['transition_residual_scales'].shape == (8,)
+    assert aux['local_channel_scales'].shape == (12,)
+    assert aux['local_channel_dense_scales'].shape == (12, 3)
+    assert aux['local_channel_branch_weights'].shape == (12, 3)
+    assert aux['local_channel_channel_gain'].shape == (12,)
+    assert aux['local_channel_update_ratio'].shape == (12,)
     assert torch.allclose(denoised_complex, aux['coarse_complex'], atol=1e-6)
     assert torch.allclose(
         denoised_mag,
@@ -70,6 +75,22 @@ def main():
     assert torch.count_nonzero(aux['dense_bridge_scales']) == 0
     assert torch.count_nonzero(aux['transition_residual_scales']) == 0
     assert torch.allclose(
+        aux['local_channel_scales'],
+        torch.full((12,), 0.05, device=device),
+        atol=1e-6
+    )
+    assert torch.count_nonzero(aux['local_channel_dense_scales']) == 0
+    assert torch.allclose(
+        aux['local_channel_branch_weights'],
+        torch.full((12, 3), 1.0 / (3.0 ** 0.5), device=device),
+        atol=1e-7
+    )
+    assert torch.equal(
+        aux['local_channel_channel_gain'], torch.ones(12, device=device)
+    )
+    assert torch.isfinite(aux['local_channel_update_ratio']).all()
+    assert torch.all(aux['local_channel_update_ratio'] >= 0.0)
+    assert torch.allclose(
         aux['pitch_posterior'].sum(dim=-1),
         torch.ones(batch_size, frames, device=device),
         atol=1e-6
@@ -84,7 +105,7 @@ def main():
         f'magnitude={tuple(denoised_mag.shape)}, '
         f'phase={tuple(pred_phase.shape)}, complex={tuple(denoised_complex.shape)}'
     )
-    print('hierarchical residual-dense harmonic restoration smoke test passed')
+    print('stabilized TF-LCA harmonic restoration smoke test passed')
 
 
 if __name__ == '__main__':

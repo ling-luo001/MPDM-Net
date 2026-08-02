@@ -394,9 +394,27 @@ def train(rank, args, cfg):
                         transition_residual_scale = (
                             aux_snapshot['transition_residual_scales'].abs().mean().item()
                         )
-                        local_channel_scale = (
-                            aux_snapshot['local_channel_scales'].abs().mean().item()
+                        local_channel_dense_scale = (
+                            aux_snapshot['local_channel_dense_scales'].abs().mean().item()
                         )
+                        local_channel_branch_weights = (
+                            aux_snapshot['local_channel_branch_weights'].mean(dim=0).tolist()
+                        )
+                        local_channel_gain = (
+                            aux_snapshot['local_channel_channel_gain'].mean().item()
+                        )
+                        suppression_local_scale = aux_snapshot[
+                            'local_channel_suppression_scale_mean'
+                        ].item()
+                        restoration_local_scale = aux_snapshot[
+                            'local_channel_restoration_scale_mean'
+                        ].item()
+                        suppression_update_ratio = aux_snapshot[
+                            'local_channel_suppression_update_ratio_mean'
+                        ].item()
+                        restoration_update_ratio = aux_snapshot[
+                            'local_channel_restoration_update_ratio_mean'
+                        ].item()
 
                         print(
                             'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
@@ -412,12 +430,24 @@ def train(rank, args, cfg):
                             'Residual-dense diagnostics - Pitch peak: {:4.3f}, Voicing: {:4.3f}, '
                             'Voice target: {:4.3f}, '
                             'Deep-filter activity: {:4.3f}, Generated activity: {:4.3f}, '
-                            'Dense bridge scale: {:4.3f}, Transition scale: {:4.3f}, '
-                            'Local-channel scale: {:4.3f}'.format(
+                            'Dense bridge scale: {:4.3f}, Transition scale: {:4.3f}'.format(
                                 pitch_peak, voicing_mean, voicing_target_mean,
                                 deep_filter_activity, generated_activity,
-                                dense_bridge_scale, transition_residual_scale,
-                                local_channel_scale
+                                dense_bridge_scale, transition_residual_scale
+                            ),
+                            flush=True
+                        )
+                        print(
+                            'TF-LCA - scale S/R: {:.3f}/{:.3f}, dense: {:.3f}, '
+                            'branch 3/T/F: {:.3f}/{:.3f}/{:.3f}, gain: {:.3f}, '
+                            'update S/R: {:.3f}/{:.3f}'.format(
+                                suppression_local_scale,
+                                restoration_local_scale,
+                                local_channel_dense_scale,
+                                *local_channel_branch_weights,
+                                local_channel_gain,
+                                suppression_update_ratio,
+                                restoration_update_ratio,
                             ),
                             flush=True
                         )
@@ -506,6 +536,50 @@ def train(rank, args, cfg):
                     sw.add_scalar(
                         "Training/Local Channel Scale",
                         aux_snapshot['local_channel_scales'].abs().mean().item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "TF-LCA/Suppression Scale",
+                        aux_snapshot['local_channel_suppression_scale_mean'].item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "TF-LCA/Restoration Scale",
+                        aux_snapshot['local_channel_restoration_scale_mean'].item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "TF-LCA/Dense Scale",
+                        aux_snapshot['local_channel_dense_scales'].abs().mean().item(),
+                        steps
+                    )
+                    branch_weights = aux_snapshot[
+                        'local_channel_branch_weights'
+                    ].mean(dim=0)
+                    for branch_name, branch_weight in zip(
+                        ('3x3 Weight', 'Temporal Weight', 'Frequency Weight'),
+                        branch_weights,
+                    ):
+                        sw.add_scalar(
+                            f"TF-LCA/{branch_name}", branch_weight.item(), steps
+                        )
+                    sw.add_scalar(
+                        "TF-LCA/Channel Gain",
+                        aux_snapshot['local_channel_channel_gain'].mean().item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "TF-LCA/Suppression Update Ratio",
+                        aux_snapshot[
+                            'local_channel_suppression_update_ratio_mean'
+                        ].item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "TF-LCA/Restoration Update Ratio",
+                        aux_snapshot[
+                            'local_channel_restoration_update_ratio_mean'
+                        ].item(),
                         steps
                     )
 

@@ -168,7 +168,8 @@ model_cfg:
   restoration_width_ratio: 1.0  # Full-capacity conditional restoration tower.
   dense_bridge_width_ratio: 0.5  # Bottleneck width inside cross-stage dense bridges.
   local_channel_strip_kernel: 7  # Axis-aware local receptive field after each Mamba stage.
-  local_channel_initial_scale: 0.1  # Stable but immediately trainable residual update.
+  local_channel_initial_scale: 0.05  # Matches the original effective update after centering ECA at one.
+  local_channel_dense_initial_scale: 0.0  # Start branch reuse from the original parallel TF-LCA path.
   complex_residual_gate_bias: -2.0  # Start with a conservative residual gate.
   deep_filter_offsets: [-2, -1, 1, 2]  # Neighboring complex-filter frames.
   deep_filter_gate_bias: -2.0
