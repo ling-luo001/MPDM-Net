@@ -104,7 +104,7 @@ env_setting:
   summary_interval: 200
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:29508  # Dedicated port for the RDHI experiment.
+    dist_url: tcp://localhost:29510  # Dedicated port for stabilized RDHI mini.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
@@ -170,7 +170,8 @@ model_cfg:
   rdhi_enabled: true  # Group restoration tokens by Stage-1 suppression demand.
   rdhi_bins: 8
   rdhi_heads: 4
-  rdhi_initial_scale: 0.05
+  rdhi_local_initial_scale: 0.01
+  rdhi_summary_initial_scale: 0.0
   rdhi_eps: 0.000001
   complex_residual_gate_bias: -2.0  # Start with a conservative residual gate.
   deep_filter_offsets: [-2, -1, 1, 2]  # Neighboring complex-filter frames.

@@ -394,7 +394,17 @@ def train(rank, args, cfg):
                         transition_residual_scale = (
                             aux_snapshot['transition_residual_scales'].abs().mean().item()
                         )
-                        rdhi_scale = aux_snapshot['rdhi_scale'].item()
+                        rdhi_local_scale = aux_snapshot['rdhi_local_scale'].item()
+                        rdhi_summary_scale = aux_snapshot['rdhi_summary_scale'].item()
+                        rdhi_local_update_ratio = (
+                            aux_snapshot['rdhi_local_update_ratio'].item()
+                        )
+                        rdhi_summary_update_ratio = (
+                            aux_snapshot['rdhi_summary_update_ratio'].item()
+                        )
+                        rdhi_bin_demand_span_mean = (
+                            aux_snapshot['rdhi_bin_demand_span_mean'].item()
+                        )
                         rdhi_demand_mean = aux_snapshot['rdhi_demand_mean'].item()
                         rdhi_padding_utilization = (
                             aux_snapshot['rdhi_padding_utilization'].item()
@@ -422,9 +432,15 @@ def train(rank, args, cfg):
                             flush=True
                         )
                         print(
-                            'RDHI diagnostics - Scale: {:4.3f}, Demand mean: {:4.3f}, '
+                            'RDHI diagnostics - Local scale: {:4.3f}, Summary scale: {:4.3f}, '
+                            'Local ratio: {:4.3f}, Summary ratio: {:4.3f}, '
+                            'Demand span: {:4.3f}, Demand mean: {:4.3f}, '
                             'Padding utilization: {:4.3f}'.format(
-                                rdhi_scale,
+                                rdhi_local_scale,
+                                rdhi_summary_scale,
+                                rdhi_local_update_ratio,
+                                rdhi_summary_update_ratio,
+                                rdhi_bin_demand_span_mean,
                                 rdhi_demand_mean,
                                 rdhi_padding_utilization,
                             ),
@@ -513,7 +529,29 @@ def train(rank, args, cfg):
                         steps
                     )
                     sw.add_scalar(
-                        "Training/RDHI Scale", aux_snapshot['rdhi_scale'].item(), steps
+                        "Training/RDHI Local Scale",
+                        aux_snapshot['rdhi_local_scale'].item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/RDHI Summary Scale",
+                        aux_snapshot['rdhi_summary_scale'].item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/RDHI Local Update Ratio",
+                        aux_snapshot['rdhi_local_update_ratio'].item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/RDHI Summary Update Ratio",
+                        aux_snapshot['rdhi_summary_update_ratio'].item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/RDHI Bin Demand Span Mean",
+                        aux_snapshot['rdhi_bin_demand_span_mean'].item(),
+                        steps
                     )
                     sw.add_scalar(
                         "Training/RDHI Demand Mean",

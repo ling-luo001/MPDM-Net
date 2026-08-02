@@ -19,14 +19,30 @@ d = clip(abs(X - S0) / (X + eps), 0, 1)
 ```
 
 The demand map is average-pooled to the restoration bottleneck and detached for
-sorting. Bottleneck tokens are sorted by demand, divided into eight equal-size
-buckets, mixed within each bucket, summarized across buckets, and restored to
-their original time-frequency positions. A bounded residual scale starts at
-`0.05`.
+sorting. Bottleneck tokens are sorted by demand and divided into eight
+equal-size buckets. Pre-normalized raw tokens first receive a bounded bucket
+attention residual. Bucket summaries are then computed from the resulting
+local tokens and receive a separate cross-bucket attention residual. The two
+updates are projected by an identity-initialized linear layer, added to the raw
+sorted tokens, and strictly inverse-sorted to their original time-frequency
+positions.
+
+The local residual scale starts at `0.01`, close to the scale learned by the
+original mini run. The cross-bin summary scale starts at zero, so it receives a
+gradient immediately without injecting a random summary update on the first
+step. This separation lets the model accept local interaction while rejecting
+cross-bin interaction, instead of suppressing both through one shared scale.
 
 RDHI is inserted once, after `dense_bridges['middle']` and before the restoration
 TMamba/FMamba blocks. Losses, Mamba depth, output heads, harmonic analysis, and
 data selection are unchanged.
+
+## Stability Diagnostics
+
+Training logs report the detached local and summary scales, each projected
+update's RMS ratio relative to its input, mean demand span inside a bin, mean
+restoration demand, and padding utilization. `rdhi_scale` remains available as
+a compatibility alias for the local scale.
 
 ## Interpretation Boundary
 
@@ -48,7 +64,7 @@ histogram attention or time-frequency attention is new by itself.
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/g515528/software/anaconda3/envs/mambavision/bin/python \
   -u train.py \
-  --exp_name restoration_demand_histogram_mini_v1 \
+  --exp_name restoration_demand_histogram_stabilized_mini_v1 \
   --config recipes/Mamba-SEUNet/Mamba-SEUNet.yaml \
   --mini \
   --epochs 200

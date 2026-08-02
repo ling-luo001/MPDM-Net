@@ -271,8 +271,11 @@ class MambaSEUNet(nn.Module):
         self.rdhi_enabled = bool(cfg['model_cfg'].get('rdhi_enabled', True))
         self.rdhi_bins = int(cfg['model_cfg'].get('rdhi_bins', 8))
         self.rdhi_heads = int(cfg['model_cfg'].get('rdhi_heads', 4))
-        self.rdhi_initial_scale = float(
-            cfg['model_cfg'].get('rdhi_initial_scale', 0.05)
+        self.rdhi_local_initial_scale = float(
+            cfg['model_cfg'].get('rdhi_local_initial_scale', 0.01)
+        )
+        self.rdhi_summary_initial_scale = float(
+            cfg['model_cfg'].get('rdhi_summary_initial_scale', 0.0)
         )
         self.rdhi_eps = float(cfg['model_cfg'].get('rdhi_eps', 1e-6))
         if self.rdhi_eps <= 0.0:
@@ -394,7 +397,8 @@ class MambaSEUNet(nn.Module):
                 restore_dim[2],
                 bins=self.rdhi_bins,
                 heads=self.rdhi_heads,
-                initial_scale=self.rdhi_initial_scale,
+                local_initial_scale=self.rdhi_local_initial_scale,
+                summary_initial_scale=self.rdhi_summary_initial_scale,
             )
             torch.random.set_rng_state(rng_state)
 
@@ -778,6 +782,9 @@ class MambaSEUNet(nn.Module):
         )
         rdhi_demand_mean = noisy_mag_4d.new_zeros(())
         rdhi_padding_utilization = noisy_mag_4d.new_ones(())
+        rdhi_local_update_ratio = noisy_mag_4d.new_zeros(())
+        rdhi_summary_update_ratio = noisy_mag_4d.new_zeros(())
+        rdhi_bin_demand_span_mean = noisy_mag_4d.new_zeros(())
         if self.rdhi is not None:
             restoration_demand = (
                 (noisy_mag_4d - coarse_mag_4d).abs()
@@ -793,6 +800,15 @@ class MambaSEUNet(nn.Module):
                     restore_x3.shape[-2] * restore_x3.shape[-1]
                 )
             )
+            rdhi_local_update_ratio = self.rdhi.latest_diagnostics[
+                'local_update_ratio'
+            ]
+            rdhi_summary_update_ratio = self.rdhi.latest_diagnostics[
+                'summary_update_ratio'
+            ]
+            rdhi_bin_demand_span_mean = self.rdhi.latest_diagnostics[
+                'bin_demand_span_mean'
+            ]
         for tm_block, fm_block in zip(self.restore_TM_middle, self.restore_FM_middle):
             restore_x3 = tm_block(restore_x3)
             restore_x3 = fm_block(restore_x3)
@@ -937,9 +953,20 @@ class MambaSEUNet(nn.Module):
             'dense_bridge_scales': dense_bridge_scales,
             'transition_residual_scales': transition_residual_scales,
             'rdhi_scale': (
-                self.rdhi.effective_scale.detach()
+                self.rdhi.effective_local_scale.detach()
                 if self.rdhi is not None else noisy_mag_4d.new_zeros(())
             ),
+            'rdhi_local_scale': (
+                self.rdhi.effective_local_scale.detach()
+                if self.rdhi is not None else noisy_mag_4d.new_zeros(())
+            ),
+            'rdhi_summary_scale': (
+                self.rdhi.effective_summary_scale.detach()
+                if self.rdhi is not None else noisy_mag_4d.new_zeros(())
+            ),
+            'rdhi_local_update_ratio': rdhi_local_update_ratio,
+            'rdhi_summary_update_ratio': rdhi_summary_update_ratio,
+            'rdhi_bin_demand_span_mean': rdhi_bin_demand_span_mean,
             'rdhi_demand_mean': rdhi_demand_mean,
             'rdhi_padding_utilization': rdhi_padding_utilization,
         }

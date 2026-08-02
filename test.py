@@ -44,11 +44,21 @@ def main():
     assert aux['dense_bridge_scales'].shape == (6,)
     assert aux['transition_residual_scales'].shape == (8,)
     assert aux['rdhi_scale'].ndim == 0
+    assert aux['rdhi_local_scale'].ndim == 0
+    assert aux['rdhi_summary_scale'].ndim == 0
+    assert aux['rdhi_local_update_ratio'].ndim == 0
+    assert aux['rdhi_summary_update_ratio'].ndim == 0
+    assert aux['rdhi_bin_demand_span_mean'].ndim == 0
     assert aux['rdhi_demand_mean'].ndim == 0
     assert aux['rdhi_padding_utilization'].ndim == 0
     assert torch.allclose(
-        aux['rdhi_scale'], torch.tensor(0.05, device=device), atol=1e-6
+        aux['rdhi_scale'], torch.tensor(0.01, device=device), atol=1e-6
     )
+    assert torch.equal(aux['rdhi_scale'], aux['rdhi_local_scale'])
+    assert aux['rdhi_summary_scale'].item() == 0.0
+    assert aux['rdhi_local_update_ratio'].item() >= 0.0
+    assert aux['rdhi_summary_update_ratio'].item() == 0.0
+    assert aux['rdhi_bin_demand_span_mean'].item() >= 0.0
     assert 0.0 <= aux['rdhi_demand_mean'].item() <= 1.0
     assert 0.0 < aux['rdhi_padding_utilization'].item() <= 1.0
     assert torch.allclose(denoised_complex, aux['coarse_complex'], atol=1e-6)
