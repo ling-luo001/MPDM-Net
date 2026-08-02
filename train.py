@@ -394,6 +394,11 @@ def train(rank, args, cfg):
                         transition_residual_scale = (
                             aux_snapshot['transition_residual_scales'].abs().mean().item()
                         )
+                        rdhi_scale = aux_snapshot['rdhi_scale'].item()
+                        rdhi_demand_mean = aux_snapshot['rdhi_demand_mean'].item()
+                        rdhi_padding_utilization = (
+                            aux_snapshot['rdhi_padding_utilization'].item()
+                        )
 
                         print(
                             'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
@@ -415,6 +420,15 @@ def train(rank, args, cfg):
                                 dense_bridge_scale, transition_residual_scale
                             ),
                             flush=True
+                        )
+                        print(
+                            'RDHI diagnostics - Scale: {:4.3f}, Demand mean: {:4.3f}, '
+                            'Padding utilization: {:4.3f}'.format(
+                                rdhi_scale,
+                                rdhi_demand_mean,
+                                rdhi_padding_utilization,
+                            ),
+                            flush=True,
                         )
 
                 # Checkpointing
@@ -496,6 +510,19 @@ def train(rank, args, cfg):
                     sw.add_scalar(
                         "Training/Transition Residual Scale",
                         aux_snapshot['transition_residual_scales'].abs().mean().item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/RDHI Scale", aux_snapshot['rdhi_scale'].item(), steps
+                    )
+                    sw.add_scalar(
+                        "Training/RDHI Demand Mean",
+                        aux_snapshot['rdhi_demand_mean'].item(),
+                        steps
+                    )
+                    sw.add_scalar(
+                        "Training/RDHI Padding Utilization",
+                        aux_snapshot['rdhi_padding_utilization'].item(),
                         steps
                     )
 

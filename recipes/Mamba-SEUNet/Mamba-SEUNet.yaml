@@ -104,7 +104,7 @@ env_setting:
   summary_interval: 200
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:29504  # Dedicated port for the residual-dense experiment.
+    dist_url: tcp://localhost:29508  # Dedicated port for the RDHI experiment.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
@@ -167,6 +167,11 @@ model_cfg:
   phase_eps: 0.001  # Floor for low-energy phase atan2 to keep backward finite.
   restoration_width_ratio: 1.0  # Full-capacity conditional restoration tower.
   dense_bridge_width_ratio: 0.5  # Bottleneck width inside cross-stage dense bridges.
+  rdhi_enabled: true  # Group restoration tokens by Stage-1 suppression demand.
+  rdhi_bins: 8
+  rdhi_heads: 4
+  rdhi_initial_scale: 0.05
+  rdhi_eps: 0.000001
   complex_residual_gate_bias: -2.0  # Start with a conservative residual gate.
   deep_filter_offsets: [-2, -1, 1, 2]  # Neighboring complex-filter frames.
   deep_filter_gate_bias: -2.0

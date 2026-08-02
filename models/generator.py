@@ -8,6 +8,7 @@ from einops import rearrange
 from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
+from .rdhi import RestorationDemandHistogramInteraction
 import torch.nn.functional as F
 
 
@@ -267,6 +268,15 @@ class MambaSEUNet(nn.Module):
         )
         if not 0.0 < self.dense_bridge_width_ratio <= 2.0:
             raise ValueError('dense_bridge_width_ratio must be in (0, 2].')
+        self.rdhi_enabled = bool(cfg['model_cfg'].get('rdhi_enabled', True))
+        self.rdhi_bins = int(cfg['model_cfg'].get('rdhi_bins', 8))
+        self.rdhi_heads = int(cfg['model_cfg'].get('rdhi_heads', 4))
+        self.rdhi_initial_scale = float(
+            cfg['model_cfg'].get('rdhi_initial_scale', 0.05)
+        )
+        self.rdhi_eps = float(cfg['model_cfg'].get('rdhi_eps', 1e-6))
+        if self.rdhi_eps <= 0.0:
+            raise ValueError('rdhi_eps must be positive.')
 
         # --- 1. 初始化输入配置 ---
         mag_cfg = deepcopy(cfg)
@@ -376,6 +386,17 @@ class MambaSEUNet(nn.Module):
             ),
         })
         torch.random.set_rng_state(rng_state)
+
+        self.rdhi = None
+        if self.rdhi_enabled:
+            rng_state = torch.random.get_rng_state()
+            self.rdhi = RestorationDemandHistogramInteraction(
+                restore_dim[2],
+                bins=self.rdhi_bins,
+                heads=self.rdhi_heads,
+                initial_scale=self.rdhi_initial_scale,
+            )
+            torch.random.set_rng_state(rng_state)
 
         # One-way suppression context. Zero initialization lets restoration
         # first learn from [X, S0], then opt into bottleneck guidance.
@@ -755,6 +776,23 @@ class MambaSEUNet(nn.Module):
         restore_x3 = self.dense_bridges['middle'](
             restore_x3, *suppress_middle_features
         )
+        rdhi_demand_mean = noisy_mag_4d.new_zeros(())
+        rdhi_padding_utilization = noisy_mag_4d.new_ones(())
+        if self.rdhi is not None:
+            restoration_demand = (
+                (noisy_mag_4d - coarse_mag_4d).abs()
+                / (noisy_mag_4d + self.rdhi_eps)
+            ).clamp(0.0, 1.0)
+            restoration_demand = F.adaptive_avg_pool2d(
+                restoration_demand, restore_x3.shape[-2:]
+            )
+            restore_x3 = self.rdhi(restore_x3, restoration_demand)
+            rdhi_demand_mean = restoration_demand.detach().mean()
+            rdhi_padding_utilization = noisy_mag_4d.new_tensor(
+                self.rdhi.padding_utilization(
+                    restore_x3.shape[-2] * restore_x3.shape[-1]
+                )
+            )
         for tm_block, fm_block in zip(self.restore_TM_middle, self.restore_FM_middle):
             restore_x3 = tm_block(restore_x3)
             restore_x3 = fm_block(restore_x3)
@@ -898,5 +936,11 @@ class MambaSEUNet(nn.Module):
             'suppression_context_scale': context_scale,
             'dense_bridge_scales': dense_bridge_scales,
             'transition_residual_scales': transition_residual_scales,
+            'rdhi_scale': (
+                self.rdhi.effective_scale.detach()
+                if self.rdhi is not None else noisy_mag_4d.new_zeros(())
+            ),
+            'rdhi_demand_mean': rdhi_demand_mean,
+            'rdhi_padding_utilization': rdhi_padding_utilization,
         }
         return denoised_mag, pred_pha, denoised_com

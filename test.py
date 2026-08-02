@@ -43,6 +43,14 @@ def main():
     assert aux['restoration_gate'].shape == (batch_size, 2, frames, freq_bins)
     assert aux['dense_bridge_scales'].shape == (6,)
     assert aux['transition_residual_scales'].shape == (8,)
+    assert aux['rdhi_scale'].ndim == 0
+    assert aux['rdhi_demand_mean'].ndim == 0
+    assert aux['rdhi_padding_utilization'].ndim == 0
+    assert torch.allclose(
+        aux['rdhi_scale'], torch.tensor(0.05, device=device), atol=1e-6
+    )
+    assert 0.0 <= aux['rdhi_demand_mean'].item() <= 1.0
+    assert 0.0 < aux['rdhi_padding_utilization'].item() <= 1.0
     assert torch.allclose(denoised_complex, aux['coarse_complex'], atol=1e-6)
     assert torch.allclose(
         denoised_mag,
