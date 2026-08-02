@@ -59,7 +59,7 @@ class RDHITest(unittest.TestCase):
         self.assertEqual(module.effective_summary_scale.item(), 0.0)
 
     def test_local_path_and_summary_scale_then_summary_parameters_get_gradients(self):
-        torch.manual_seed(0)
+        torch.random.default_generator.manual_seed(0)
         module = RestorationDemandHistogramInteraction(
             8,
             bins=3,
@@ -95,7 +95,7 @@ class RDHITest(unittest.TestCase):
         self.assertGreater(summary_parameter_grad.abs().sum().item(), 0.0)
 
     def test_padding_content_does_not_change_valid_output(self):
-        torch.manual_seed(1)
+        torch.random.default_generator.manual_seed(1)
         module = RestorationDemandHistogramInteraction(8, bins=3, heads=2).eval()
         x = torch.randn(2, 8, 2, 5)
         demand = torch.rand(2, 1, 2, 5)
@@ -170,11 +170,11 @@ class RDHITest(unittest.TestCase):
         with patches[0], patches[1], patches[2], patches[3]:
             cfg_without_rdhi = copy.deepcopy(cfg)
             cfg_without_rdhi['model_cfg']['rdhi_enabled'] = False
-            torch.manual_seed(7)
+            torch.random.default_generator.manual_seed(7)
             model_without_rdhi = generator_module.MambaSEUNet(
                 cfg_without_rdhi
             ).eval()
-            torch.manual_seed(7)
+            torch.random.default_generator.manual_seed(7)
             model = generator_module.MambaSEUNet(copy.deepcopy(cfg)).eval()
             rdhi_free_state = model_without_rdhi.state_dict()
             rdhi_state = model.state_dict()
