@@ -628,7 +628,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
     # parser.add_argument('--exp_name', default='Mambavision_emb_08')
-    parser.add_argument('--exp_name', default='main_codex_mask_B')
+    parser.add_argument('--exp_name', default='residual_dense_full_v2')
     parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
     parser.add_argument('--resume_from', default=None,
                         help='Optional checkpoint directory to load from while saving into exp_folder/exp_name.')

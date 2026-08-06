@@ -54,8 +54,7 @@ def load_ckpts(args, device):
                     f"Cannot find g/do checkpoints for step {resume_step} in {ckpt_path}"
                 )
         else:
-            cp_g = scan_checkpoint(ckpt_path, 'g_')
-            cp_do = scan_checkpoint(ckpt_path, 'do_')
+            cp_g, cp_do = scan_checkpoint_pair(ckpt_path)
         if cp_g is None or cp_do is None:
             return None, None, 0, -1
         state_dict_g = load_checkpoint(cp_g, device)
@@ -83,6 +82,24 @@ def scan_checkpoint(cp_dir, prefix):
     if len(cp_list) == 0:
         return None
     return sorted(cp_list)[-1]
+
+def scan_checkpoint_pair(cp_dir):
+    """Return the numerically latest complete generator/optimizer checkpoint pair."""
+    checkpoints = {}
+    for prefix in ('g_', 'do_'):
+        steps = {}
+        pattern = os.path.join(cp_dir, prefix + '*' + '.pth')
+        for checkpoint in glob.glob(pattern):
+            step_text = os.path.basename(checkpoint)[len(prefix):-4]
+            if len(step_text) == 8 and step_text.isdigit():
+                steps[int(step_text)] = checkpoint
+        checkpoints[prefix] = steps
+
+    paired_steps = set(checkpoints['g_']) & set(checkpoints['do_'])
+    if not paired_steps:
+        return None, None
+    latest_step = max(paired_steps)
+    return checkpoints['g_'][latest_step], checkpoints['do_'][latest_step]
 
 def build_env(config, config_name, exp_path):
     os.makedirs(exp_path, exist_ok=True)
