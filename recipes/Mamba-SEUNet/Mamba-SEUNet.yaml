@@ -104,7 +104,7 @@ env_setting:
   summary_interval: 200
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:29510  # Dedicated port for stabilized RDHI mini.
+    dist_url: tcp://localhost:29510  # Dedicated port for the stabilized RDHI full experiment.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
