@@ -14,6 +14,8 @@ The fixed step is at most one and is divided by damping plus the maximum reliabi
 
 Both per-resolution gains are naturally zero-initialized. Forward output therefore matches the baseline within numerical round-trip tolerance, and the first backward produces ordinary finite gradients for those gains. The proposer is intentionally inactive at exact zero gain; after the optimizer moves either gain away from zero, ordinary product-rule gradients activate the shared proposer. No surrogate or straight-through gradient is used.
 
+The corrected spectrum is returned as an output-domain residual over the original baseline outputs. Consequently, zero gains preserve the original output values and Jacobian rather than merely reproducing the same numbers through a second magnitude/phase conversion. The tracked `max_grad_norm: 5.0` setting is applied to both generator and discriminator before their optimizer steps.
+
 ## Novelty boundary
 
 The experiment tests cross-resolution correction agreement after the native MPDM estimate. It does not claim a new backbone, input-level magnitude/phase disentanglement, a new loss, or novelty from adding an ordinary prediction head. Any thesis claim requires later literature and result-based validation; this implementation alone establishes no novelty or quality gain.
@@ -33,7 +35,7 @@ The experiment tests cross-resolution correction agreement after the native MPDM
 ## Gates
 
 1. Disabled path preserves exact baseline return objects.
-2. Zero gains preserve baseline outputs within numerical tolerance and produce finite nonzero gain gradients while proposer gradients remain naturally zero.
+2. Zero gains preserve baseline outputs and their output Jacobian within numerical tolerance, while producing finite nonzero gain gradients and naturally zero proposer gradients.
 3. Small nonzero gains activate finite nonzero proposer gradients.
 4. Reliability and correction bounds hold; all outputs and backward gradients are finite.
 5. Full-TF reliability placement changes consensus even when frequency means are equal.

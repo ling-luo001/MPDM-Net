@@ -95,6 +95,23 @@ class MRCCTests(unittest.TestCase):
             sum(float(gradient.abs().sum()) for gradient in proposer_gradients), 0.0
         )
 
+    def test_zero_gain_preserves_baseline_output_jacobian(self):
+        module = MRCCRefiner(_config())
+        inputs = list(_inputs())
+        for index in (2, 3, 4):
+            inputs[index] = inputs[index].detach().requires_grad_(True)
+
+        outputs = module(*inputs)
+        module_loss = sum(output.square().mean() for output in outputs)
+        module_gradients = torch.autograd.grad(module_loss, inputs[2:5])
+
+        direct_loss = sum(value.square().mean() for value in inputs[2:5])
+        direct_gradients = torch.autograd.grad(direct_loss, inputs[2:5])
+        for module_gradient, direct_gradient in zip(module_gradients, direct_gradients):
+            self.assertTrue(
+                torch.allclose(module_gradient, direct_gradient, atol=2.0e-6, rtol=2.0e-6)
+            )
+
     def test_proposal_and_reliability_bounds(self):
         module = MRCCRefiner(_config())
         torch.manual_seed(23)

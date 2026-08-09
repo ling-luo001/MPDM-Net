@@ -311,7 +311,17 @@ class MRCCRefiner(nn.Module):
                 f"baseline {tuple(baseline_native.shape)}"
             )
         corrected_native = baseline_native + native_correction
-        outputs = self._compressed_outputs(corrected_native)
+        corrected_outputs = self._compressed_outputs(corrected_native)
+        reference_outputs = self._compressed_outputs(baseline_native)
+        baseline_outputs = (baseline_magnitude, baseline_phase, baseline_complex)
+        # Residualizing in the repository output domain preserves both values
+        # and the baseline Jacobian while the correction gains are zero.
+        outputs = tuple(
+            baseline + (corrected - reference)
+            for baseline, corrected, reference in zip(
+                baseline_outputs, corrected_outputs, reference_outputs
+            )
+        )
 
         correction_ratios = []
         for proposed in proposed_corrections:

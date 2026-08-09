@@ -177,6 +177,7 @@ def train(rank, args, cfg):
     # scheduler_g, scheduler_d = setup_schedulers((optim_g, optim_d), cfg, last_epoch)
     optim_g, optim_d = optimizers
     scheduler_g, scheduler_d = setup_schedulers(optimizers, cfg, last_epoch)
+    max_grad_norm = float(cfg['training_cfg'].get('max_grad_norm', 5.0))
 
     # Create trainset and train_loader
     trainset = create_dataset(cfg, train=True, split=True, device=device)
@@ -233,6 +234,12 @@ def train(rank, args, cfg):
             loss_disc_all = loss_disc_r + loss_disc_g
             
             loss_disc_all.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    discriminator.parameters(),
+                    max_grad_norm,
+                    error_if_nonfinite=True,
+                )
             optim_d.step()
             # ------------------------------------------------------- #
             
@@ -267,6 +274,12 @@ def train(rank, args, cfg):
             )
 
             loss_gen_all.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    generator.parameters(),
+                    max_grad_norm,
+                    error_if_nonfinite=True,
+                )
             optim_g.step()
             # ------------------------------------------------------- #
 
