@@ -90,6 +90,7 @@ class MRCCRefiner(nn.Module):
         self.consensus_damping = float(model_cfg.get("mrcc_consensus_damping", 0.05))
         self.consensus_step = float(model_cfg.get("mrcc_consensus_step", 0.5))
         self.eps = float(model_cfg.get("mrcc_eps", 1.0e-8))
+        self.phase_eps = float(model_cfg.get("phase_eps", 1.0e-3))
         if not 0.0 < self.correction_bound <= 1.0:
             raise ValueError("mrcc_correction_bound must be in (0, 1]")
         if not 0.0 < self.reliability_floor < self.reliability_ceiling < 1.0:
@@ -98,6 +99,8 @@ class MRCCRefiner(nn.Module):
             raise ValueError("mrcc_consensus_damping must be positive")
         if not 0.0 < self.consensus_step <= 1.0:
             raise ValueError("mrcc_consensus_step must be in (0, 1]")
+        if self.eps <= 0.0 or self.phase_eps <= 0.0:
+            raise ValueError("MRCC epsilon values must be positive")
 
         self.proposer = SharedComplexResidualProposer(
             width=int(model_cfg.get("mrcc_proposer_width", 64)),
@@ -151,9 +154,15 @@ class MRCCRefiner(nn.Module):
 
     def _compressed_outputs(self, spectrum_ri: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         real, imag = spectrum_ri[:, 0], spectrum_ri[:, 1]
-        linear_magnitude = torch.sqrt(real.square() + imag.square()).clamp_min(torch.finfo(real.dtype).tiny)
+        energy = real.square() + imag.square()
+        linear_magnitude = torch.sqrt(energy.clamp_min(self.eps * self.eps))
         magnitude = linear_magnitude.pow(self.compress_factor)
-        phase = torch.atan2(imag, real)
+        phase_real = torch.where(
+            linear_magnitude.detach() < self.phase_eps,
+            torch.full_like(real, self.phase_eps),
+            real,
+        )
+        phase = torch.atan2(imag, phase_real)
         compressed_complex = torch.stack((magnitude * torch.cos(phase), magnitude * torch.sin(phase)), dim=-1)
         self._assert_finite("corrected magnitude", magnitude)
         self._assert_finite("corrected phase", phase)

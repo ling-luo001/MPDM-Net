@@ -112,6 +112,46 @@ class MRCCTests(unittest.TestCase):
                 torch.allclose(module_gradient, direct_gradient, atol=2.0e-6, rtol=2.0e-6)
             )
 
+    def test_zero_energy_bins_have_finite_polar_gradients(self):
+        module = MRCCRefiner(_config())
+        spectrum = torch.zeros(1, 2, 8, 6, requires_grad=True)
+
+        outputs = module._compressed_outputs(spectrum)
+        loss = outputs[0].mean() + outputs[1].mean() + outputs[2].square().mean()
+        gradient, = torch.autograd.grad(loss, spectrum)
+
+        self.assertTrue(all(torch.isfinite(value).all() for value in outputs))
+        self.assertTrue(torch.isfinite(gradient).all())
+
+    def test_zero_gain_jacobian_survives_zero_energy_bins(self):
+        module = MRCCRefiner(_config())
+        inputs = list(_inputs())
+        inputs[2] = inputs[2].clone()
+        inputs[2][:, 12:18, 3:7] = 0.0
+        inputs[3] = inputs[3].clone()
+        inputs[3][:, 12:18, 3:7] = 0.0
+        inputs[4] = torch.stack(
+            (
+                inputs[2] * torch.cos(inputs[3]),
+                inputs[2] * torch.sin(inputs[3]),
+            ),
+            dim=-1,
+        )
+        for index in (2, 3, 4):
+            inputs[index] = inputs[index].detach().requires_grad_(True)
+
+        outputs = module(*inputs)
+        module_loss = sum(output.square().mean() for output in outputs)
+        module_gradients = torch.autograd.grad(module_loss, inputs[2:5])
+        direct_loss = sum(value.square().mean() for value in inputs[2:5])
+        direct_gradients = torch.autograd.grad(direct_loss, inputs[2:5])
+
+        self.assertTrue(all(torch.isfinite(value).all() for value in module_gradients))
+        for module_gradient, direct_gradient in zip(module_gradients, direct_gradients):
+            self.assertTrue(
+                torch.allclose(module_gradient, direct_gradient, atol=2.0e-6, rtol=2.0e-6)
+            )
+
     def test_proposal_and_reliability_bounds(self):
         module = MRCCRefiner(_config())
         torch.manual_seed(23)
