@@ -33,7 +33,7 @@ class _DepthwiseResidualBlock(nn.Module):
 class SharedComplexResidualProposer(nn.Module):
     """Shared convolutional proposer with learned resolution conditioning."""
 
-    def __init__(self, width: int = 64, depth: int = 4, condition_dim: int = 384):
+    def __init__(self, width: int = 64, depth: int = 4, condition_dim: int = 240):
         super().__init__()
         if width < 8 or depth < 1 or condition_dim < 8:
             raise ValueError("MRCC proposer width/depth/condition_dim are too small")
@@ -102,7 +102,7 @@ class MRCCRefiner(nn.Module):
         self.proposer = SharedComplexResidualProposer(
             width=int(model_cfg.get("mrcc_proposer_width", 64)),
             depth=int(model_cfg.get("mrcc_proposer_depth", 4)),
-            condition_dim=int(model_cfg.get("mrcc_condition_dim", 384)),
+            condition_dim=int(model_cfg.get("mrcc_condition_dim", 240)),
         )
         self.correction_gains = nn.Parameter(torch.zeros(2))
         self.last_diagnostics: Dict[str, torch.Tensor] = {}

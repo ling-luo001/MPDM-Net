@@ -23,7 +23,7 @@ The experiment tests cross-resolution correction agreement after the native MPDM
 - Recipe: `recipes/Mamba-SEUNet/MRCC-MPDM-v1-mini.yaml`
 - Native STFT: 510/510/120, Hann, centered, compression factor 0.3
 - Auxiliary STFTs: 128/128/32 and 256/256/64, Hann, centered
-- Shared proposer: width 64, four depthwise-separable residual blocks, condition dimension 384
+- Shared proposer: width 64, four depthwise-separable residual blocks, condition dimension 240
 - Consensus: exactly two iterations, fixed step 0.5, full-TF reliability, damping 0.05
 - Training: existing mini manifests, 200 epochs, distributed port 29512
 - Default direct launch: `python train.py`

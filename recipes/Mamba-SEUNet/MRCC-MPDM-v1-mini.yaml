@@ -70,7 +70,7 @@ model_cfg:
     - [256, 256, 64]
   mrcc_proposer_width: 64
   mrcc_proposer_depth: 4
-  mrcc_condition_dim: 384
+  mrcc_condition_dim: 240
   mrcc_correction_bound: 0.1
   mrcc_reliability_floor: 0.05
   mrcc_reliability_ceiling: 0.95
