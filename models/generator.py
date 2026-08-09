@@ -9,6 +9,7 @@ from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
 from .cross import VSSBlock_Cross_new
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
+from .mrcc import MRCCRefiner
 import torch.nn.functional as F
 
 
@@ -300,6 +301,8 @@ class MambaSEUNet(nn.Module):
         pha_dec_cfg = deepcopy(cfg)
         pha_dec_cfg['model_cfg']['hid_feature'] = pha_base
         self.phase_decoder = PhaseDecoder(pha_dec_cfg)
+        self.mrcc_enabled = bool(cfg['model_cfg'].get('mrcc_enabled', False))
+        self.mrcc = MRCCRefiner(cfg) if self.mrcc_enabled else None
 
     def forward(self, noisy_mag, noisy_pha):
         if not torch.isfinite(noisy_mag).all():
@@ -496,4 +499,12 @@ class MambaSEUNet(nn.Module):
         if not torch.isfinite(denoised_com).all():
             raise RuntimeError('denoised_com contains NaN/Inf')
 
-        return denoised_mag, pred_pha, denoised_com
+        if self.mrcc is None:
+            return denoised_mag, pred_pha, denoised_com
+        return self.mrcc(
+            noisy_mag,
+            noisy_pha,
+            denoised_mag,
+            pred_pha,
+            denoised_com,
+        )

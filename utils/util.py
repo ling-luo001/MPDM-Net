@@ -3,6 +3,7 @@ import torch
 import os
 import shutil
 import glob
+import re
 from torch.distributed import init_process_group
 
 def load_config(config_path):
@@ -44,14 +45,37 @@ def log_model_info(rank, model, exp_path):
 def load_ckpts(args, device):
     """Load checkpoints if available."""
     if os.path.isdir(args.exp_path):
-        cp_g = scan_checkpoint(args.exp_path, 'g_')
-        cp_do = scan_checkpoint(args.exp_path, 'do_')
+        cp_g, cp_do = find_latest_paired_checkpoints(args.exp_path)
         if cp_g is None or cp_do is None:
             return None, None, 0, -1
         state_dict_g = load_checkpoint(cp_g, device)
         state_dict_do = load_checkpoint(cp_do, device)
         return state_dict_g, state_dict_do, state_dict_do['steps'] + 1, state_dict_do['epoch']
     return None, None, 0, -1
+
+
+def find_latest_paired_checkpoints(checkpoint_dir):
+    """Return the numerically latest complete generator/training-state pair."""
+    patterns = {
+        'generator': re.compile(r'^g_(\d{8})\.pth$'),
+        'training': re.compile(r'^do_(\d{8})\.pth$'),
+    }
+
+    def indexed_paths(kind):
+        indexed = {}
+        for path in glob.glob(os.path.join(checkpoint_dir, '*.pth')):
+            match = patterns[kind].match(os.path.basename(path))
+            if match is not None:
+                indexed[int(match.group(1))] = path
+        return indexed
+
+    generators = indexed_paths('generator')
+    training_states = indexed_paths('training')
+    paired_steps = generators.keys() & training_states.keys()
+    if not paired_steps:
+        return None, None
+    latest_step = max(paired_steps)
+    return generators[latest_step], training_states[latest_step]
 
 def load_checkpoint(filepath, device):
     assert os.path.isfile(filepath)

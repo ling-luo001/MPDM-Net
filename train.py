@@ -320,6 +320,10 @@ def train(rank, args, cfg):
                     sw.add_scalar("Training/Complex Loss", com_error, steps)
                     sw.add_scalar("Training/Time Loss", time_error, steps)
                     sw.add_scalar("Training/Consistancy Loss", con_error, steps)
+                    unwrapped_generator = generator.module if num_gpus > 1 else generator
+                    if unwrapped_generator.mrcc is not None:
+                        for name, value in unwrapped_generator.mrcc.last_diagnostics.items():
+                            sw.add_scalar("MRCC/{}".format(name), value, steps)
 
                 # If NaN happend in training period, RaiseError
                 if torch.isnan(loss_gen_all).any():
@@ -450,8 +454,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
     # parser.add_argument('--exp_name', default='Mambavision_emb_08')
-    parser.add_argument('--exp_name', default='main_011')
-    parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
+    parser.add_argument('--exp_name', default='mrcc_mpdm_mini_v1')
+    parser.add_argument('--config', default='recipes/Mamba-SEUNet/MRCC-MPDM-v1-mini.yaml')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
