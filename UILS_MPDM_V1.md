@@ -89,3 +89,14 @@ Promote UILS beyond the paired mini experiment only if all criteria hold:
 - SI-SDR degradation is no more than 0.2 dB.
 
 Failure of any criterion rejects promotion; it does not authorize a protocol change or a new research route.
+
+## Verified Gate0 record
+
+Gate0 was completed on 2026-08-10 before the paired mini launch.
+
+- CPU numerical gate passed locally and on the Linux host: zero-gate output error `0.0`, input VJP relative error `0.0`, FP64-reference maximum errors below `1e-7`, and smoother MSE `0.039725` versus filter MSE `0.048564`.
+- All 833 shared state tensors and the post-construction CPU RNG state were identical between the paired models.
+- Baseline parameters: `2,262,712`; candidate parameters: `2,264,970`; added parameters: `2,258`.
+- RTX 3090 full-resolution profile (`B=2`, `F=T=256`, two warmups, five measured forward-backward iterations) passed: baseline/candidate time `523.422/543.851 ms`, ratio `1.0390`; candidate allocated/reserved memory `8.539/8.732 GiB`, memory ratios `1.0011/1.0013`.
+- A real one-step mini training smoke completed all generator, discriminator, waveform, magnitude, phase, complex, and consistency losses without NaN or OOM.
+- The candidate-to-baseline queue was launched from implementation commit `a86b81f`; checkpoints and TensorBoard logs are under `/var/tmp/mpdm-uils-paired` on the 3090 host.
