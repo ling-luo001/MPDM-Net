@@ -1,10 +1,10 @@
-# MRCC-MPDM v1 design and mini experiment
+# MRCC-MPDM v1 design and staged experiment
 
 ## Mechanism
 
 MRCC is a post-estimator correction module. The original magnitude/phase dual towers, seven configured VSS interactions, mask decoder, phase decoder, input API, and three-output return contract are unchanged. The baseline compressed magnitude and phase are first converted to the native linear real/imaginary spectrum. The compressed noisy input is independently converted back to its linear native spectrum and waveform, so no dataset API changes are needed.
 
-At 128/128/32 and 256/256/64 FFT/window/hop resolutions, a shared convolutional proposer receives six real-valued channels: noisy real/imaginary, baseline real/imaginary, and baseline-minus-noisy real/imaginary. A learned resolution embedding conditions all residual blocks. The two-channel proposal is direction-normalized and bounded to `0.1 * (noisy auxiliary magnitude + eps)`. Reliability is mapped into `[0.05, 0.95]`.
+At 128/128/32 and 256/256/64 FFT/window/hop resolutions, a shared convolutional proposer receives six real-valued channels: noisy real/imaginary, baseline real/imaginary, and baseline-minus-noisy real/imaginary. A learned resolution embedding conditions all residual blocks. The two-channel proposal vector norm is clipped to at most one and bounded to `0.1 * (noisy auxiliary magnitude + eps)`. Reliability is sigmoid-mapped into `(0.05, 0.95)`.
 
 Starting from exactly zero, MRCC performs exactly two differentiable shared-waveform correction iterations. At every iteration and auxiliary resolution, it analyzes the current waveform correction, forms the full-lattice residual `S_r(x) - d_r`, applies reliability independently at every time-frequency bin, and synthesizes the weighted residual back to a waveform update. The two synthesized updates and waveform damping are combined before one bounded, scalar-preconditioned step. Reliability is never averaged over frequency in either the update or objective.
 
@@ -28,9 +28,22 @@ The experiment tests cross-resolution correction agreement after the native MPDM
 - Shared proposer: width 64, four depthwise-separable residual blocks, condition dimension 240
 - Consensus: exactly two iterations, fixed step 0.5, full-TF reliability, damping 0.05
 - Training: existing mini manifests, 200 epochs, distributed port 29512
-- Default direct launch: `python train.py`
-- Default experiment: `mrcc_mpdm_mini_v1`; command-line `--config`, `--exp_name`, and `--exp_folder` overrides remain available
+- Historical mini experiment: `mrcc_mpdm_mini_v1`
+- Mini result: best validation PESQ `3.219019 @ 96k`; final recorded value `3.178951 @ 174k`
+- Explicit mini launch: `python train.py --config recipes/Mamba-SEUNet/MRCC-MPDM-v1-mini.yaml --exp_name mrcc_mpdm_mini_v1`
 - Resume: the numerically latest step present as both `g_XXXXXXXX.pth` and `do_XXXXXXXX.pth`
+
+## Full deployment
+
+- Recipe: `recipes/Mamba-SEUNet/MRCC-MPDM-v1-full.yaml`
+- Dataset: 11,572 training pairs and 824 validation pairs on the 4090 host, byte-identical to the Stabilized TF-LCA full manifests
+- Validation composition: 576 historical validation pairs plus 248 historical test pairs for compatibility with earlier full curves; final thesis evaluation requires a strictly separated validation/test protocol
+- Training: 400 epochs, batch size 2, learning rate `5e-4`, distributed port 29512
+- Default direct launch: `python train.py`
+- Default experiment: `mrcc_mpdm_full_v1`
+- Deployment commit: `d9c38c9`
+- Initial 576-validation run was archived as `mrcc_mpdm_full_v1_invalid_val576` and excluded from comparisons
+- Comparable fresh run was restarted from zero with the shared 824-pair validation manifest
 
 ## Gates
 
@@ -42,7 +55,7 @@ The experiment tests cross-resolution correction agreement after the native MPDM
 6. The actual full-TF consensus objective is non-increasing over both fixed iterations.
 7. Total generator parameters are 2.25M-2.45M.
 8. Representative measured forward/backward ratio is at most 1.70x baseline where CUDA dependencies are available.
-9. Mini training is not launched until unit and profile gates pass in the target runtime environment.
+9. Mini training was launched only after the unit and profile gates passed in the target runtime environment.
 
 ## Required ablations
 
