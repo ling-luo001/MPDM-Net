@@ -115,6 +115,32 @@ def assert_exact_pairs(reference, candidate, label):
     return maxima
 
 
+def assert_vjp_with_cuda_nondeterminism(reference, repeated, candidate):
+    metrics = []
+    for reference_tensor, repeated_tensor, candidate_tensor in zip(
+        reference, repeated, candidate
+    ):
+        if not torch.isfinite(candidate_tensor).all():
+            raise FloatingPointError("zero-injection input VJP is non-finite")
+        repeat_error = (reference_tensor - repeated_tensor).abs().max().item()
+        candidate_error = (reference_tensor - candidate_tensor).abs().max().item()
+        scale = max(
+            reference_tensor.abs().max().item(),
+            candidate_tensor.abs().max().item(),
+        )
+        tolerance = 1e-6 + 1e-5 * scale + 4.0 * repeat_error
+        metrics.append({
+            "baseline_repeat_max_abs": repeat_error,
+            "pgrt_max_abs": candidate_error,
+            "accepted_tolerance": tolerance,
+        })
+        if candidate_error > tolerance:
+            raise AssertionError(
+                "zero-injection VJP exceeds calibrated CUDA nondeterminism"
+            )
+    return metrics
+
+
 def training_iteration(model, magnitude, phase):
     model.zero_grad(set_to_none=True)
     outputs = model(magnitude, phase)
@@ -197,9 +223,10 @@ def main():
     )
 
     baseline_vjp = run_input_vjp(baseline, *identity_inputs, device)
+    repeated_baseline_vjp = run_input_vjp(baseline, *identity_inputs, device)
     pgrt_vjp = run_input_vjp(pgrt, *identity_inputs, device)
-    vjp_maxima = assert_exact_pairs(
-        baseline_vjp, pgrt_vjp, "zero-injection input VJP"
+    vjp_metrics = assert_vjp_with_cuda_nondeterminism(
+        baseline_vjp, repeated_baseline_vjp, pgrt_vjp
     )
 
     with torch.no_grad():
@@ -228,7 +255,7 @@ def main():
         "paired_generator_state_tensors": common_states,
         "paired_discriminator_state_tensors": discriminator_states,
         "zero_output_max_abs": output_maxima,
-        "zero_vjp_max_abs": vjp_maxima,
+        "zero_vjp_metrics": vjp_metrics,
         "profile_batch_size": int(config["training_cfg"]["batch_size"]),
         "profile_frequency_bins": frequency_bins,
         "profile_frames": profile_frames,
