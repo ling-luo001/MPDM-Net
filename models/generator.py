@@ -9,6 +9,7 @@ from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
 from .cross import VSSBlock_Cross_new
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
+from .pgrt import PGRTInteraction
 import torch.nn.functional as F
 
 
@@ -301,6 +302,26 @@ class MambaSEUNet(nn.Module):
         pha_dec_cfg['model_cfg']['hid_feature'] = pha_base
         self.phase_decoder = PhaseDecoder(pha_dec_cfg)
 
+        self.pgrt = None
+        if bool(cfg['model_cfg'].get('pgrt_enabled', False)):
+            # Preserve every baseline initialization draw and downstream RNG state.
+            with torch.random.fork_rng(devices=[]):
+                self.pgrt = PGRTInteraction(
+                    channels=mag_dim[2],
+                    num_stages=self.num_mid_stages,
+                    hidden=int(cfg['model_cfg'].get('pgrt_hidden_channels', 24)),
+                    max_offset=float(cfg['model_cfg'].get('pgrt_max_offset', 1.0)),
+                    offset_residual_bound=float(
+                        cfg['model_cfg'].get('pgrt_offset_residual_bound', 0.25)
+                    ),
+                    injection_bound=float(
+                        cfg['model_cfg'].get('pgrt_injection_bound', 0.25)
+                    ),
+                    eps=float(cfg['model_cfg'].get('pgrt_energy_eps', 1e-6)),
+                    n_fft=int(cfg['stft_cfg']['n_fft']),
+                    hop_size=int(cfg['stft_cfg']['hop_size']),
+                )
+
     def forward(self, noisy_mag, noisy_pha):
         if not torch.isfinite(noisy_mag).all():
              raise RuntimeError('Input noisy_mag contains NaN/Inf')
@@ -365,6 +386,23 @@ class MambaSEUNet(nn.Module):
         pha_fm_blocks = self.pha_FM_middle
         pha_prev = pha_x3
 
+        analytic_offsets = None
+        analytic_confidence = None
+        if self.pgrt is not None:
+            self.pgrt.reset_diagnostics()
+            analytic_offsets, analytic_confidence, analytic_diagnostics = (
+                self.pgrt.analytic_field(
+                    noisy_mag,
+                    noisy_pha,
+                    target_size=mag_x3.shape[-2:],
+                    return_diagnostics=True,
+                )
+            )
+            self.pgrt.last_diagnostics.update({
+                "analytic/offset_abs_max": analytic_diagnostics["offset_abs_max"],
+                "analytic/confidence_mean": analytic_diagnostics["confidence_mean"],
+            })
+
         # ---------------------------
         # Middle交替：FM/TM 处理后立即耦合融合（取代交叉注意力）
         stage_pairs = []
@@ -382,6 +420,15 @@ class MambaSEUNet(nn.Module):
             mag_in_fuse = self.mid_in_proj_mag[idx](mag_feat)
             pha_in_fuse = self.mid_in_proj_pha[idx](pha_feat)
             mag_fused, pha_fused = self.mid_fusions[idx](mag_in_fuse, pha_in_fuse)
+            if self.pgrt is not None:
+                mag_fused, pha_fused = self.pgrt(
+                    mag_in_fuse,
+                    pha_in_fuse,
+                    analytic_offsets,
+                    analytic_confidence,
+                    stage_index=idx,
+                    base_outputs=(mag_fused, pha_fused),
+                )
 
             mag_cat = torch.cat([mag_feat, mag_fused], dim=1)
             pha_cat = torch.cat([pha_feat, pha_fused], dim=1)

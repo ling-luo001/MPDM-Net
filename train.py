@@ -72,7 +72,8 @@ def create_val_dataset(cfg, train=True, split=True, device='cuda:0'):
         n_cache_reuse=0,
         shuffle=shuffle,
         device=device,
-        pcs=pcs
+        pcs=pcs,
+        data_root=cfg['data_cfg'].get('data_root')
     )
 
 
@@ -96,7 +97,8 @@ def create_dataset(cfg, train=True, split=True, device='cuda:0'):
         n_cache_reuse=0,
         shuffle=shuffle,
         device=device,
-        pcs=pcs
+        pcs=pcs,
+        data_root=cfg['data_cfg'].get('data_root')
     )
 
 def create_dataloader(dataset, cfg, train=True):
@@ -177,6 +179,7 @@ def train(rank, args, cfg):
     # scheduler_g, scheduler_d = setup_schedulers((optim_g, optim_d), cfg, last_epoch)
     optim_g, optim_d = optimizers
     scheduler_g, scheduler_d = setup_schedulers(optimizers, cfg, last_epoch)
+    max_grad_norm = float(cfg['training_cfg'].get('max_grad_norm', 5.0))
 
     # Create trainset and train_loader
     trainset = create_dataset(cfg, train=True, split=True, device=device)
@@ -233,6 +236,11 @@ def train(rank, args, cfg):
             loss_disc_all = loss_disc_r + loss_disc_g
             
             loss_disc_all.backward()
+            grad_norm_d = torch.nn.utils.clip_grad_norm_(
+                discriminator.parameters(),
+                max_grad_norm,
+                error_if_nonfinite=True,
+            )
             optim_d.step()
             # ------------------------------------------------------- #
             
@@ -267,6 +275,11 @@ def train(rank, args, cfg):
             )
 
             loss_gen_all.backward()
+            grad_norm_g = torch.nn.utils.clip_grad_norm_(
+                generator.parameters(),
+                max_grad_norm,
+                error_if_nonfinite=True,
+            )
             optim_g.step()
             # ------------------------------------------------------- #
 
@@ -320,6 +333,14 @@ def train(rank, args, cfg):
                     sw.add_scalar("Training/Complex Loss", com_error, steps)
                     sw.add_scalar("Training/Time Loss", time_error, steps)
                     sw.add_scalar("Training/Consistancy Loss", con_error, steps)
+                    sw.add_scalar("Training/Generator Grad Norm", grad_norm_g, steps)
+                    sw.add_scalar("Training/Discriminator Grad Norm", grad_norm_d, steps)
+
+                    unwrapped_generator = generator.module if hasattr(generator, 'module') else generator
+                    pgrt = getattr(unwrapped_generator, 'pgrt', None)
+                    if pgrt is not None:
+                        for name, value in getattr(pgrt, 'last_diagnostics', {}).items():
+                            sw.add_scalar(f"PGRT/{name}", value, steps)
 
                 # If NaN happend in training period, RaiseError
                 if torch.isnan(loss_gen_all).any():
@@ -449,9 +470,8 @@ def train(rank, args, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
-    # parser.add_argument('--exp_name', default='Mambavision_emb_08')
-    parser.add_argument('--exp_name', default='main_011')
-    parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
+    parser.add_argument('--exp_name', default='pgrt_mpdm_mini_v1')
+    parser.add_argument('--config', default='recipes/Mamba-SEUNet/PGRT-MPDM-v1-mini.yaml')
     args = parser.parse_args()
 
     cfg = load_config(args.config)

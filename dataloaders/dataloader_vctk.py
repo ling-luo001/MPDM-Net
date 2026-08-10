@@ -1,4 +1,5 @@
 import os
+import posixpath
 import json
 import random
 import torch
@@ -15,9 +16,19 @@ def list_files_in_directory(directory_path):
                 files.append(os.path.join(root, filename))
     return files
 
-def load_json_file(file_path):
+def load_json_file(file_path, data_root=None):
     with open(file_path, 'r') as json_file:
         data = json.load(json_file)
+    if data_root:
+        join_path = posixpath.join if data_root.startswith('/') else os.path.join
+        data = [
+            join_path(
+                data_root,
+                os.path.basename(os.path.dirname(path)),
+                os.path.basename(path),
+            )
+            for path in data
+        ]
     return data
 
 def extract_identifier(file_path):
@@ -60,11 +71,12 @@ class VCTKDemandDataset(torch.utils.data.Dataset):
         n_cache_reuse=1, 
         shuffle=True, 
         device=None, 
-        pcs=False
+        pcs=False,
+        data_root=None
     ):
 
-        self.clean_wavs_path = load_json_file( clean_json )
-        self.noisy_wavs_path = load_json_file( noisy_json )
+        self.clean_wavs_path = load_json_file(clean_json, data_root)
+        self.noisy_wavs_path = load_json_file(noisy_json, data_root)
         random.seed(1234)
 
         if shuffle:
@@ -169,11 +181,12 @@ class Val_Dataset(torch.utils.data.Dataset):
         n_cache_reuse=1,
         shuffle=True,
         device=None,
-        pcs=False
+        pcs=False,
+        data_root=None
     ):
 
-        self.clean_wavs_path = load_json_file( clean_json )
-        self.noisy_wavs_path = load_json_file( noisy_json )
+        self.clean_wavs_path = load_json_file(clean_json, data_root)
+        self.noisy_wavs_path = load_json_file(noisy_json, data_root)
         random.seed(1234)
 
         if shuffle:
