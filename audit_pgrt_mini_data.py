@@ -53,8 +53,14 @@ def main():
         config = yaml.safe_load(handle)
     data_config = config["data_cfg"]
     data_root = data_config.get("data_root")
+    repository_root = os.path.dirname(os.path.abspath(__file__))
     manifests = {
-        key: load_rebased_manifest(data_config[key], data_root)
+        key: load_rebased_manifest(
+            data_config[key]
+            if os.path.isabs(data_config[key])
+            else os.path.join(repository_root, data_config[key]),
+            data_root,
+        )
         for key in MANIFEST_KEYS
     }
 
