@@ -9,6 +9,7 @@ from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock, CBAM
 from .cross import VSSBlock_Cross_new
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
+from .uils import UILS
 import torch.nn.functional as F
 
 
@@ -295,6 +296,20 @@ class MambaSEUNet(nn.Module):
         )
 
         # --- 4. 最终解码器 ---
+        self.uils_enabled = bool(cfg['model_cfg'].get('uils_enabled', False))
+        self.uils = None
+        if self.uils_enabled:
+            cpu_rng_state = torch.random.get_rng_state()
+            try:
+                self.uils = UILS(
+                    mag_channels=mag_dim[2],
+                    pha_channels=pha_dim[2],
+                    mag_state_dim=8,
+                    pha_state_dim=4,
+                )
+            finally:
+                torch.random.set_rng_state(cpu_rng_state)
+
         self.mag_to_mask_proj = nn.Conv2d(mag_dim[0], mag_base, 1, 1, 0, bias=False)
         self.mask_decoder = MagDecoder(cfg)
         pha_dec_cfg = deepcopy(cfg)
@@ -390,6 +405,9 @@ class MambaSEUNet(nn.Module):
             # 保持残差链路
             mag_x3 = mag_x3 + mag_res
             pha_x3 = pha_x3 + pha_res
+
+        if self.uils_enabled:
+            mag_x3, pha_x3 = self.uils(mag_x3, pha_x3)
 
         # ---------------------------
         # Decoder Level2 (after upsample+concat -> mamba -> residual)

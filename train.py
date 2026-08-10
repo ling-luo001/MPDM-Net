@@ -198,6 +198,11 @@ def train(rank, args, cfg):
             print("Epoch: {}".format(epoch+1))
 
         for i, batch in enumerate(train_loader):
+            if args.max_steps is not None and steps >= args.max_steps:
+                if rank == 0:
+                    sw.close()
+                    print(f'Reached max_steps={args.max_steps}; training stopped cleanly.')
+                return
             if rank == 0:
                 start_b = time.time()
             if len(batch) == 7:
@@ -452,7 +457,12 @@ def main():
     # parser.add_argument('--exp_name', default='Mambavision_emb_08')
     parser.add_argument('--exp_name', default='main_011')
     parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
+    parser.add_argument('--max_steps', type=int, default=None,
+                        help='Stop before processing this global training step.')
     args = parser.parse_args()
+
+    if args.max_steps is not None and args.max_steps <= 0:
+        parser.error('--max_steps must be a positive integer')
 
     cfg = load_config(args.config)
     seed = cfg['env_setting']['seed']
