@@ -467,8 +467,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
     # parser.add_argument('--exp_name', default='Mambavision_emb_08')
-    parser.add_argument('--exp_name', default='mrcc_mpdm_mini_v1')
-    parser.add_argument('--config', default='recipes/Mamba-SEUNet/MRCC-MPDM-v1-mini.yaml')
+    parser.add_argument('--exp_name', default='mrcc_mpdm_full_v1')
+    parser.add_argument('--config', default='recipes/Mamba-SEUNet/MRCC-MPDM-v1-full.yaml')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
