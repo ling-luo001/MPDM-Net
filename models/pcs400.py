@@ -1,12 +1,6 @@
 # Reference: https://github.com/RoyChao19477/SEMamba/models/pcs400
 
-import os
-import torch
-import torchaudio
 import numpy as np
-import argparse
-import librosa
-import scipy
 
 # PCS400 parameters
 PCS400 = np.ones(201)
@@ -21,14 +15,16 @@ PCS400[160:190] = 1.161403509
 PCS400[190:202] = 1.077192982
 
 maxv = np.iinfo(np.int16).max
+N_FFT = 400
+HOP_LENGTH = 100
+PCS_WINDOW = np.hamming(N_FFT)
 
 def Sp_and_phase(signal):
     signal_length = signal.shape[0]
-    n_fft = 400
-    hop_length = 100
-    y_pad = librosa.util.fix_length(signal, size=signal_length + n_fft // 2)
-
-    F = librosa.stft(y_pad, n_fft=400, hop_length=100, win_length=400, window=scipy.signal.windows.hamming(400))
+    y_pad = np.pad(signal, (0, N_FFT // 2))
+    centered = np.pad(y_pad, (N_FFT // 2, N_FFT // 2))
+    frames = np.lib.stride_tricks.sliding_window_view(centered, N_FFT)[::HOP_LENGTH]
+    F = np.fft.rfft(frames * PCS_WINDOW, n=N_FFT, axis=-1).T
     Lp = PCS400 * np.transpose(np.log1p(np.abs(F)), (1, 0))
     phase = np.angle(F)
 
@@ -40,16 +36,32 @@ def Sp_and_phase(signal):
 def SP_to_wav(mag, phase, signal_length):
     mag = np.expm1(mag)
     Rec = np.multiply(mag, np.exp(1j*phase))
-    result = librosa.istft(Rec,
-                           hop_length=100,
-                           win_length=400,
-                           window=scipy.signal.windows.hamming(400),
-                           length=signal_length)
+    frames = np.fft.irfft(Rec.T, n=N_FFT, axis=-1) * PCS_WINDOW
+    output_length = N_FFT + HOP_LENGTH * (frames.shape[0] - 1)
+    result = np.zeros(output_length, dtype=frames.dtype)
+    window_norm = np.zeros(output_length, dtype=frames.dtype)
+    window_square = PCS_WINDOW ** 2
+    for frame_index, frame in enumerate(frames):
+        start = frame_index * HOP_LENGTH
+        result[start:start + N_FFT] += frame
+        window_norm[start:start + N_FFT] += window_square
+    valid = window_norm > np.finfo(window_norm.dtype).tiny
+    result[valid] /= window_norm[valid]
+    start = N_FFT // 2
+    result = result[start:start + signal_length]
+    if result.shape[0] < signal_length:
+        result = np.pad(result, (0, signal_length - result.shape[0]))
     return result
 
 def cal_pcs(signal_wav):
+    signal_wav = np.asarray(signal_wav)
+    input_dtype = signal_wav.dtype
     noisy_LP, Nphase, signal_length = Sp_and_phase(signal_wav.squeeze())
     enhanced_wav = SP_to_wav(noisy_LP, Nphase, signal_length)
-    enhanced_wav = enhanced_wav/np.max(abs(enhanced_wav))
+    peak = np.max(np.abs(enhanced_wav))
+    if peak > 0.0 and np.isfinite(peak):
+        enhanced_wav = enhanced_wav / peak
+    else:
+        enhanced_wav = np.zeros_like(enhanced_wav)
 
-    return enhanced_wav
+    return enhanced_wav.astype(input_dtype, copy=False)
