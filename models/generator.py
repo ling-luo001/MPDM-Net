@@ -8,6 +8,7 @@ from einops import rearrange
 from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
+from .zip_refine_mp import ZipRefineMP
 import torch.nn.functional as F
 
 
@@ -470,6 +471,18 @@ class MambaSEUNet(nn.Module):
         self.restoration_gate = _make_full_resolution_head(
             restore_dim[0], 2, self.complex_residual_gate_bias
         )
+        self.zip_refine_mp_enabled = bool(
+            cfg['model_cfg'].get('zip_refine_mp_enabled', False)
+        )
+        self.zip_refiner = None
+        if self.zip_refine_mp_enabled:
+            # The optional candidate must not perturb baseline initialization or
+            # the caller's post-construction CPU RNG stream.
+            rng_state = torch.random.get_rng_state()
+            try:
+                self.zip_refiner = ZipRefineMP(cfg)
+            finally:
+                torch.random.set_rng_state(rng_state)
         self.latest_aux = {}
 
     def _build_harmonic_templates(self):
@@ -828,6 +841,21 @@ class MambaSEUNet(nn.Module):
         applied_real_4d = harmonic_real_4d + aperiodic_real_4d
         applied_imag_4d = harmonic_imag_4d + aperiodic_imag_4d
 
+        base_real_4d = coarse_real_4d + applied_real_4d
+        base_imag_4d = coarse_imag_4d + applied_imag_4d
+        zip_refine_aux = {}
+        if self.zip_refiner is not None:
+            noisy_complex_4d = torch.cat((noisy_real_4d, noisy_imag_4d), dim=1)
+            base_complex_4d = torch.cat((base_real_4d, base_imag_4d), dim=1)
+            refined_complex_4d, zip_refine_aux = self.zip_refiner(
+                noisy_complex_4d, base_complex_4d
+            )
+            enh_real_4d, enh_imag_4d = torch.chunk(
+                refined_complex_4d, 2, dim=1
+            )
+        else:
+            enh_real_4d, enh_imag_4d = base_real_4d, base_imag_4d
+
         coarse_real = rearrange(coarse_real_4d.squeeze(1), 'b t f -> b f t')
         coarse_imag = rearrange(coarse_imag_4d.squeeze(1), 'b t f -> b f t')
         applied_real = rearrange(applied_real_4d.squeeze(1), 'b t f -> b f t')
@@ -844,8 +872,8 @@ class MambaSEUNet(nn.Module):
         aperiodic_applied_imag = rearrange(
             aperiodic_imag_4d.squeeze(1), 'b t f -> b f t'
         )
-        enh_real = coarse_real + applied_real
-        enh_imag = coarse_imag + applied_imag
+        enh_real = rearrange(enh_real_4d.squeeze(1), 'b t f -> b f t')
+        enh_imag = rearrange(enh_imag_4d.squeeze(1), 'b t f -> b f t')
         denoised_mag = torch.sqrt(torch.clamp(enh_real ** 2 + enh_imag ** 2, min=1e-12))
         if not torch.isfinite(denoised_mag).all():
             raise RuntimeError('denoised_mag contains NaN/Inf')
@@ -899,4 +927,6 @@ class MambaSEUNet(nn.Module):
             'dense_bridge_scales': dense_bridge_scales,
             'transition_residual_scales': transition_residual_scales,
         }
+        if zip_refine_aux:
+            self.latest_aux.update(zip_refine_aux)
         return denoised_mag, pred_pha, denoised_com
