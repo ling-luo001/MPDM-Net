@@ -90,6 +90,19 @@ Promote UILS beyond the paired mini experiment only if all criteria hold:
 
 Failure of any criterion rejects promotion; it does not authorize a protocol change or a new research route.
 
+## Full candidate run
+
+The full-data candidate keeps the mini candidate seed, batch size, learning rate, losses, model configuration, and validation interval. Training uses all 11,572 full training pairs. Validation uses the canonical 824-pair `valid + test` manifest used by the original, Residual-Dense, Harmonic-Generative, and MRCC full runs; `data/test_noisy_all.json` is the noisy counterpart of the existing `data/test_clean_all.json`. The process group uses the dedicated endpoint `tcp://localhost:29531`.
+
+The full recipe saves checkpoints every 4,000 steps instead of every 2,000 steps. This changes only snapshot cadence: optimization and the 2,000-step validation cadence are unchanged. The reduced checkpoint frequency is required for storage-safe deployment because the approximately 2,314,400-step full run would otherwise need about 31.4 GiB for observed UILS checkpoint-pair sizes, while `/var/tmp` has only 24 GiB free.
+
+```text
+EXP_ROOT=/var/tmp/mpdm-uils-full \
+  bash scripts/run_uils_candidate_full.sh
+```
+
+Override the interpreter with `PYTHON_BIN` when needed. The fixed experiment name is `uils_mpdm_candidate_full_v1`. Re-running the command uses the same experiment directory, so `train.py` resumes from its latest paired generator/optimizer-discriminator checkpoints. Launcher output is appended to `${EXP_ROOT}/uils_mpdm_candidate_full_v1.stdout.log`; prior output is not truncated.
+
 ## Verified Gate0 record
 
 Gate0 was completed on 2026-08-10 before the paired mini launch.
