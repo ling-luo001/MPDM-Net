@@ -79,6 +79,7 @@ model_cfg:
   output_channel: 1
   num_mid_pairs: 3
   zip_refine_mp_enabled: true
+  zip_refine_mp_activation_checkpointing: true
   zip_refine_mp_channels: 112
   zip_refine_mp_eps: 0.000001
   zip_refine_mp_delta_limit: 1.0

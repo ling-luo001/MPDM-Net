@@ -56,6 +56,16 @@ is constructed after all baseline generator state, while the CPU RNG state is
 saved and restored around construction. With the same seed, all shared state
 tensors and the post-construction CPU RNG state therefore match the baseline.
 
+`model_cfg.zip_refine_mp_activation_checkpointing` controls activation
+checkpointing and defaults to false when absent. The dedicated RD-ZipRefine-MP
+recipe sets it to true. In training with autograd enabled, each of the four
+magnitude and four phase axis-refinement stages is executed through
+`torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`. The stage output is
+unchanged in the forward pass, while stage internals are recomputed during
+backward instead of retaining their activations. Evaluation and no-grad execution
+bypass checkpointing. This changes neither modules nor parameters, and leaves the
+batch size and loss configuration untouched.
+
 When enabled, `latest_aux` includes:
 
 - `base_complex`
@@ -114,6 +124,8 @@ dependency-compatible structure, and the stub depends on those tensors so
 gradient connectivity is tested. Deformable convolution is replaced only during
 this local test by an ordinary convolution. This validates tensor contracts,
 module-level and paired-generator exact identity/VJP behavior, gradient
-connectivity, RNG isolation, structural parameter-range screening, and a small
-generator forward/backward. It is not real selective-scan, deformable-convolution, CUDA,
-performance, memory, convergence, or audio-quality validation.
+connectivity, activation-checkpoint forward/loss parity and backward-gradient
+parity, training/evaluation scope, RNG isolation, structural parameter-range
+screening, and a small generator forward/backward. It is not real selective-scan,
+deformable-convolution, CUDA, performance, memory, convergence, or audio-quality
+validation.

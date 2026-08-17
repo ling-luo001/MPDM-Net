@@ -11,6 +11,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .mamba_block import FMambaBlock, TMambaBlock
 
@@ -104,6 +105,9 @@ class ZipRefineMP(nn.Module):
         self.channels = int(model_cfg.get('zip_refine_mp_channels', 112))
         self.eps = float(model_cfg.get('zip_refine_mp_eps', 1e-6))
         self.delta_limit = float(model_cfg.get('zip_refine_mp_delta_limit', 1.0))
+        self.activation_checkpointing = bool(
+            model_cfg.get('zip_refine_mp_activation_checkpointing', False)
+        )
         if self.channels <= 0:
             raise ValueError('zip_refine_mp_channels must be positive.')
         if self.eps <= 0.0:
@@ -143,6 +147,11 @@ class ZipRefineMP(nn.Module):
         self.outer_mag_gate = nn.Parameter(torch.zeros(()))
         self.outer_phase_gate = nn.Parameter(torch.zeros(()))
 
+    def _run_stage(self, stage, features):
+        if self.activation_checkpointing and self.training and torch.is_grad_enabled():
+            return checkpoint(stage, features, use_reentrant=False)
+        return stage(features)
+
     def build_eight_map_input(self, noisy_complex, base_complex):
         for name, value in (('noisy_complex', noisy_complex), ('base_complex', base_complex)):
             if value.ndim != 4 or value.shape[1] != 2:
@@ -174,8 +183,8 @@ class ZipRefineMP(nn.Module):
         phase_features = self.phase_stem(maps)
         for mag_stage, phase_stage, interaction in zip(
                 self.mag_stages, self.phase_stages, self.interactions):
-            mag_features = mag_stage(mag_features)
-            phase_features = phase_stage(phase_features)
+            mag_features = self._run_stage(mag_stage, mag_features)
+            phase_features = self._run_stage(phase_stage, phase_features)
             mag_features, phase_features = interaction(mag_features, phase_features)
 
         bounded_delta = self.delta_limit * torch.tanh(

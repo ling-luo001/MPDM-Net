@@ -175,6 +175,7 @@ def _assert_config_control():
         'experiment_cfg',
         'env_setting.dist_cfg.dist_url',
         'model_cfg.zip_refine_mp_enabled',
+        'model_cfg.zip_refine_mp_activation_checkpointing',
         'model_cfg.zip_refine_mp_channels',
         'model_cfg.zip_refine_mp_eps',
         'model_cfg.zip_refine_mp_delta_limit',
@@ -182,6 +183,7 @@ def _assert_config_control():
     assert differences == allowed, (differences, allowed)
     assert candidate['experiment_cfg']['name'] == 'rd_ziprefine_mp_mini_v1'
     assert candidate['experiment_cfg']['log_name'] == 'rd_ziprefine_mp_mini_v1'
+    assert candidate['model_cfg']['zip_refine_mp_activation_checkpointing'] is True
     assert candidate['model_cfg']['zip_refine_mp_delta_limit'] == 1.0
 
     forbidden = ('load_state_dict', 'torch.load', 'resume_from', 'pretrained', '.pth')
@@ -207,6 +209,7 @@ def _assert_refiner_contract():
     torch.manual_seed(101)
     refiner = ZipRefineMP(_actual_cfg())
     assert refiner.compression_ratios == (1, 2, 2, 1)
+    assert refiner.activation_checkpointing is True
     assert refiner.delta_limit == 1.0
     for mag_stage, phase_stage in zip(refiner.mag_stages, refiner.phase_stages):
         assert isinstance(mag_stage.axis_blocks[0], FMambaBlock)
@@ -255,6 +258,98 @@ def _assert_refiner_contract():
         rtol=1e-6,
     )
     print('PASS eight-map input, ratios [1,2,2,1], odd/even shape and finite')
+
+
+def _assert_activation_checkpointing():
+    import torch
+    import models.zip_refine_mp as zip_refine_module
+    from models.zip_refine_mp import ZipRefineMP
+
+    enabled_cfg = _actual_cfg()
+    disabled_cfg = copy.deepcopy(enabled_cfg)
+    disabled_cfg['model_cfg']['zip_refine_mp_activation_checkpointing'] = False
+    default_cfg = copy.deepcopy(enabled_cfg)
+    default_cfg['model_cfg'].pop('zip_refine_mp_activation_checkpointing')
+
+    torch.manual_seed(151)
+    disabled = ZipRefineMP(disabled_cfg).train()
+    enabled = ZipRefineMP(enabled_cfg).train()
+    enabled.load_state_dict(disabled.state_dict())
+    assert ZipRefineMP(default_cfg).activation_checkpointing is False
+
+    with torch.no_grad():
+        for refiner in (disabled, enabled):
+            refiner.outer_mag_gate.fill_(1e-3)
+            refiner.outer_phase_gate.fill_(1e-3)
+
+    noisy_source = torch.randn(1, 2, 5, 7)
+    base_source = torch.randn(1, 2, 5, 7)
+    cotangent = torch.randn_like(base_source)
+    checkpoint_calls = []
+    real_checkpoint = zip_refine_module.checkpoint
+
+    def tracked_checkpoint(function, *args, **kwargs):
+        checkpoint_calls.append(kwargs.copy())
+        return real_checkpoint(function, *args, **kwargs)
+
+    zip_refine_module.checkpoint = tracked_checkpoint
+    try:
+        enabled_noisy = noisy_source.clone().requires_grad_(True)
+        enabled_base = base_source.clone().requires_grad_(True)
+        enabled_output, _ = enabled(enabled_noisy, enabled_base)
+        enabled_loss = (enabled_output * cotangent).sum()
+        enabled_loss.backward()
+    finally:
+        zip_refine_module.checkpoint = real_checkpoint
+
+    assert len(checkpoint_calls) == 8, len(checkpoint_calls)
+    assert all(call == {'use_reentrant': False} for call in checkpoint_calls)
+
+    disabled_noisy = noisy_source.clone().requires_grad_(True)
+    disabled_base = base_source.clone().requires_grad_(True)
+    disabled_output, _ = disabled(disabled_noisy, disabled_base)
+    disabled_loss = (disabled_output * cotangent).sum()
+    disabled_loss.backward()
+
+    assert torch.equal(enabled_output, disabled_output)
+    assert torch.equal(enabled_loss, disabled_loss)
+    for enabled_input, disabled_input in (
+            (enabled_noisy, disabled_noisy), (enabled_base, disabled_base)):
+        assert torch.allclose(enabled_input.grad, disabled_input.grad, atol=1e-6, rtol=1e-5)
+    for (enabled_name, enabled_parameter), (disabled_name, disabled_parameter) in zip(
+            enabled.named_parameters(), disabled.named_parameters()):
+        assert enabled_name == disabled_name
+        if enabled_parameter.grad is None or disabled_parameter.grad is None:
+            assert enabled_parameter.grad is disabled_parameter.grad, enabled_name
+        else:
+            assert torch.allclose(
+                enabled_parameter.grad, disabled_parameter.grad, atol=1e-6, rtol=1e-5
+            ), enabled_name
+
+    checkpoint_calls.clear()
+    zip_refine_module.checkpoint = tracked_checkpoint
+    try:
+        enabled.eval()
+        eval_output, _ = enabled(noisy_source, base_source)
+    finally:
+        zip_refine_module.checkpoint = real_checkpoint
+    assert not checkpoint_calls
+    disabled.eval()
+    disabled_eval_output, _ = disabled(noisy_source, base_source)
+    assert torch.equal(eval_output, disabled_eval_output)
+
+    zip_refine_module.checkpoint = tracked_checkpoint
+    try:
+        enabled.train()
+        with torch.no_grad():
+            enabled(noisy_source, base_source)
+    finally:
+        zip_refine_module.checkpoint = real_checkpoint
+    assert not checkpoint_calls
+    print(
+        'PASS activation checkpoint default-off, eight non-reentrant training-stage '
+        'calls, eval/no-grad bypass, exact forward/loss, and matching backward gradients'
+    )
 
 
 def _assert_identity_and_gradients():
@@ -322,6 +417,7 @@ def _assert_rng_and_parameters():
     baseline_cfg = copy.deepcopy(candidate_cfg)
     baseline_cfg.pop('experiment_cfg', None)
     baseline_cfg['model_cfg'].pop('zip_refine_mp_enabled', None)
+    baseline_cfg['model_cfg'].pop('zip_refine_mp_activation_checkpointing', None)
     baseline_cfg['model_cfg'].pop('zip_refine_mp_channels', None)
     baseline_cfg['model_cfg'].pop('zip_refine_mp_eps', None)
     baseline_cfg['model_cfg'].pop('zip_refine_mp_delta_limit', None)
@@ -372,6 +468,7 @@ def _assert_generator_forward_backward(generator):
     baseline_cfg.pop('experiment_cfg', None)
     for key in (
         'zip_refine_mp_enabled',
+        'zip_refine_mp_activation_checkpointing',
         'zip_refine_mp_channels',
         'zip_refine_mp_eps',
         'zip_refine_mp_delta_limit',
@@ -429,6 +526,7 @@ def main():
     _install_mamba_forward_stub()
     _assert_config_control()
     _assert_refiner_contract()
+    _assert_activation_checkpointing()
     _assert_identity_and_gradients()
     generator = _assert_rng_and_parameters()
     _assert_generator_forward_backward(generator)
