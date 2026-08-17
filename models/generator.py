@@ -6,6 +6,7 @@ import math
 from torchvision.ops.deform_conv import DeformConv2d
 from einops import rearrange
 from copy import deepcopy
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
 import torch.nn.functional as F
@@ -245,6 +246,9 @@ class MambaSEUNet(nn.Module):
     def __init__(self, cfg):
         super(MambaSEUNet, self).__init__()
         self.cfg = cfg
+        self.activation_checkpointing = bool(
+            cfg.get('training_cfg', {}).get('activation_checkpointing', False)
+        )
         self.num_tscblocks = cfg['model_cfg'].get('num_tfmamba', 4)
         self.num_mid_pairs = int(cfg['model_cfg'].get('num_mid_pairs', 2))
         self.num_mid_pairs = max(1, min(4, self.num_mid_pairs))
@@ -472,6 +476,11 @@ class MambaSEUNet(nn.Module):
         )
         self.latest_aux = {}
 
+    def _run_mamba_block(self, block, inputs):
+        if self.activation_checkpointing and self.training and torch.is_grad_enabled():
+            return activation_checkpoint(block, inputs, use_reentrant=False)
+        return block(inputs)
+
     def _build_harmonic_templates(self):
         n_fft = int(self.cfg['stft_cfg']['n_fft'])
         sample_rate = float(self.cfg['stft_cfg']['sampling_rate'])
@@ -590,7 +599,7 @@ class MambaSEUNet(nn.Module):
         mag_copy1 = mag_x1
         mag_x1 = self.mag_patch_embed_encoder_level1(mag_x1)
         for block in self.mag_TSMamba1_encoder:
-            mag_x1 = block(mag_x1)
+            mag_x1 = self._run_mamba_block(block, mag_x1)
         mag_x1 = mag_copy1 + mag_x1
         mag_skip1 = mag_x1
 
@@ -598,7 +607,7 @@ class MambaSEUNet(nn.Module):
         mag_copy2 = mag_x2
         mag_x2 = self.mag_patch_embed_encoder_level2(mag_x2)
         for block in self.mag_TSMamba2_encoder:
-            mag_x2 = block(mag_x2)
+            mag_x2 = self._run_mamba_block(block, mag_x2)
         mag_x2 = mag_copy2 + mag_x2
         mag_skip2 = mag_x2
 
@@ -606,8 +615,8 @@ class MambaSEUNet(nn.Module):
         mag_x3 = self.mag_patch_embed_middle(mag_x3)
         suppress_middle_features = [mag_x3]
         for fm_block, tm_block in zip(self.mag_FM_middle, self.mag_TM_middle):
-            mag_x3 = fm_block(mag_x3)
-            mag_x3 = tm_block(mag_x3)
+            mag_x3 = self._run_mamba_block(fm_block, mag_x3)
+            mag_x3 = self._run_mamba_block(tm_block, mag_x3)
             suppress_middle_features.append(mag_x3)
         suppress_bottleneck = mag_x3
 
@@ -617,7 +626,7 @@ class MambaSEUNet(nn.Module):
         mag_y2_copy = mag_y2
         mag_y2 = self.mag_patch_embed_decoder_level2(mag_y2)
         for block in self.mag_TSMamba2_decoder:
-            mag_y2 = block(mag_y2)
+            mag_y2 = self._run_mamba_block(block, mag_y2)
         mag_y2 = mag_y2_copy + mag_y2
 
         # Decode to the original encoder resolution.
@@ -626,14 +635,14 @@ class MambaSEUNet(nn.Module):
         mag_y1_copy = mag_y1
         mag_y1 = self.mag_patch_embed_decoder_level1(mag_y1)
         for block in self.mag_TSMamba1_decoder:
-            mag_y1 = block(mag_y1)
+            mag_y1 = self._run_mamba_block(block, mag_y1)
         mag_y1 = mag_y1_copy + mag_y1
 
         # Refine Stage 1 features before coarse reconstruction.
         mag_copy_ref = mag_y1
         mag_y1 = self.mag_patch_embed_refinement(mag_y1)
         for block in self.mag_refinement:
-            mag_y1 = block(mag_y1)
+            mag_y1 = self._run_mamba_block(block, mag_y1)
         mag_final = self.mag_output(mag_y1 + mag_copy_ref) + mag_skip1
 
         # Coarse signal reconstruction.
@@ -724,7 +733,7 @@ class MambaSEUNet(nn.Module):
         restore_copy1 = restore_x1
         restore_x1 = self.restore_patch_embed_encoder_level1(restore_x1)
         for block in self.restore_TMamba1_encoder:
-            restore_x1 = block(restore_x1)
+            restore_x1 = self._run_mamba_block(block, restore_x1)
         restore_x1 = restore_copy1 + restore_x1
         restore_x1 = self.dense_bridges['encoder_level1'](
             restore_x1, mag_skip1, mag_y1, mag_final
@@ -735,7 +744,7 @@ class MambaSEUNet(nn.Module):
         restore_copy2 = restore_x2
         restore_x2 = self.restore_patch_embed_encoder_level2(restore_x2)
         for block in self.restore_TMamba2_encoder:
-            restore_x2 = block(restore_x2)
+            restore_x2 = self._run_mamba_block(block, restore_x2)
         restore_x2 = restore_copy2 + restore_x2
         restore_x2 = self.dense_bridges['encoder_level2'](
             restore_x2, mag_skip2, mag_y2
@@ -756,8 +765,8 @@ class MambaSEUNet(nn.Module):
             restore_x3, *suppress_middle_features
         )
         for tm_block, fm_block in zip(self.restore_TM_middle, self.restore_FM_middle):
-            restore_x3 = tm_block(restore_x3)
-            restore_x3 = fm_block(restore_x3)
+            restore_x3 = self._run_mamba_block(tm_block, restore_x3)
+            restore_x3 = self._run_mamba_block(fm_block, restore_x3)
 
         restore_y2 = self.restore_up3_2(restore_x3)
         restore_y2 = self.restore_concat_level2(
@@ -766,7 +775,7 @@ class MambaSEUNet(nn.Module):
         restore_y2_copy = restore_y2
         restore_y2 = self.restore_patch_embed_decoder_level2(restore_y2)
         for block in self.restore_TMamba2_decoder:
-            restore_y2 = block(restore_y2)
+            restore_y2 = self._run_mamba_block(block, restore_y2)
         restore_y2 = restore_y2_copy + restore_y2
         restore_y2 = self.dense_bridges['decoder_level2'](
             restore_y2, mag_skip2, mag_y2
@@ -779,7 +788,7 @@ class MambaSEUNet(nn.Module):
         restore_y1_copy = restore_y1
         restore_y1 = self.restore_patch_embed_decoder_level1(restore_y1)
         for block in self.restore_TMamba1_decoder:
-            restore_y1 = block(restore_y1)
+            restore_y1 = self._run_mamba_block(block, restore_y1)
         restore_y1 = restore_y1_copy + restore_y1
         restore_y1 = self.dense_bridges['decoder_level1'](
             restore_y1, mag_skip1, mag_y1, mag_final
@@ -788,7 +797,7 @@ class MambaSEUNet(nn.Module):
         restore_copy_ref = restore_y1
         restore_y1 = self.restore_patch_embed_refinement(restore_y1)
         for block in self.restore_refinement:
-            restore_y1 = block(restore_y1)
+            restore_y1 = self._run_mamba_block(block, restore_y1)
         restore_final = self.restore_output(restore_y1 + restore_copy_ref) + restore_skip1
         restore_final = self.dense_bridges['output'](restore_final, mag_final)
 

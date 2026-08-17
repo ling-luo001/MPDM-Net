@@ -10,10 +10,12 @@ python train.py --config recipes/RD-PCS-L/RD-PCS-L.yaml --exp_name rd_pcs_l_h24_
 
 Do not pass any resume option and start only with a fresh output namespace. Gate 0 does not run this command, start training, or read weights.
 
+`training_cfg.activation_checkpointing` controls activation checkpointing for the generator's main Mamba blocks. It defaults to `false` when omitted and is explicitly `false` in the dedicated Gate 0 recipe. A separate full-training config may set it to `true`; checkpointing then uses PyTorch's non-reentrant path only while the model is in training mode with gradients enabled. It does not add parameters, alter the model state dict, change batch size or precision, or affect evaluation forwards.
+
 Run local Gate 0 from this worktree with the project environment:
 
 ```powershell
 E:\anaconda3\envs\Mamba1\python.exe gate0_rd_pcs_l.py
 ```
 
-The script checks YAML parsing and route values, PCS silence/tiny/ordinary-wave behavior, train-only PCS routing, and a small finite forward/backward. It constructs H16/N2, an in-memory-only H20/N3 midpoint, and H24/N3, then requires their parameter counts to increase strictly in that order; only H24/N3 has a recipe. The script reports actual forward/backward timings. If `selective_scan_cuda` is unavailable, it prints a prominent notice and substitutes only Mamba's sequence operation with a shape-preserving differentiable stub. In that mode the forward/backward result is structural validation, not real CUDA Mamba runtime validation.
+The script checks YAML parsing and route values, PCS silence/tiny/ordinary-wave behavior, train-only PCS routing, and a small finite forward/backward. It also enables activation checkpointing in memory, verifies all 42 configured main Mamba block calls use `use_reentrant=False`, and checks forward-output/loss parity plus finite checkpointed backward. It constructs H16/N2, an in-memory-only H20/N3 midpoint, and H24/N3, then requires their parameter counts to increase strictly in that order; only H24/N3 has a recipe. The script reports actual forward/backward timings. If `selective_scan_cuda` is unavailable, it prints a prominent notice and substitutes only Mamba's sequence operation with a shape-preserving differentiable stub. In that mode the forward/backward result is structural validation, not real CUDA Mamba runtime validation.

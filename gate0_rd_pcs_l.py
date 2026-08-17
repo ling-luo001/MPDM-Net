@@ -57,6 +57,10 @@ def check_config() -> tuple[dict, dict]:
     for key, value in expected.items():
         require(candidate["model_cfg"].get(key) == value, f"Unexpected {key}")
     require(candidate["training_cfg"].get("use_PCS400") is True, "PCS must be enabled")
+    require(
+        candidate["training_cfg"].get("activation_checkpointing") is False,
+        "The dedicated Gate 0 recipe must keep activation checkpointing disabled",
+    )
     experiment = candidate.get("experiment_cfg", {})
     require(experiment.get("name") == EXPECTED_EXPERIMENT_NAME, "Wrong experiment name")
     require(
@@ -70,6 +74,7 @@ def check_config() -> tuple[dict, dict]:
     normalized = deepcopy(candidate)
     normalized.pop("experiment_cfg")
     normalized["env_setting"]["dist_cfg"]["dist_url"] = baseline["env_setting"]["dist_cfg"]["dist_url"]
+    normalized["training_cfg"].pop("activation_checkpointing")
     normalized["training_cfg"]["use_PCS400"] = baseline["training_cfg"]["use_PCS400"]
     normalized["model_cfg"]["hid_feature"] = baseline["model_cfg"]["hid_feature"]
     normalized["model_cfg"]["num_tfmamba"] = baseline["model_cfg"]["num_tfmamba"]
@@ -91,6 +96,7 @@ def check_config() -> tuple[dict, dict]:
     require(not found, f"Weight reuse keys are forbidden in the recipe: {sorted(found)}")
     print(f"[PASS] config: {RECIPE_PATH.relative_to(ROOT)}")
     print("       controlled diff: capacity + PCS + isolated experiment namespace/port")
+    print("       activation checkpointing: explicitly disabled for Gate 0")
     print(f"       future output/log namespace: exp/{EXPECTED_EXPERIMENT_NAME}")
     print("       future mini mode: add --mini to the documented launch command")
     return candidate, baseline
@@ -243,6 +249,10 @@ def check_models(
     print("[INFO] capacity construction:")
     torch.manual_seed(1234)
     baseline, baseline_params, _ = construct_and_count(MambaSEUNet, baseline_cfg, "H16/N2 baseline")
+    require(
+        baseline.activation_checkpointing is False,
+        "Checkpointing must default to disabled when the config key is absent",
+    )
     del baseline
 
     torch.manual_seed(1234)
@@ -254,6 +264,10 @@ def check_models(
     torch.manual_seed(1234)
     candidate, candidate_params, _ = construct_and_count(MambaSEUNet, candidate_cfg, "H24/N3 candidate")
     require(
+        candidate.activation_checkpointing is False,
+        "The dedicated recipe must keep checkpointing disabled",
+    )
+    require(
         baseline_params < intermediate_params < candidate_params,
         "Expected H16/N2 < H20/N3 < H24/N3 parameter counts",
     )
@@ -264,6 +278,7 @@ def check_models(
     noisy_mag = torch.rand(1, 256, 4)
     noisy_pha = (torch.rand(1, 256, 4) - 0.5) * (2.0 * math.pi)
     forward_started = time.perf_counter()
+    rng_state = torch.random.get_rng_state()
     outputs = candidate(noisy_mag, noisy_pha)
     forward_elapsed = time.perf_counter() - forward_started
     expected_shapes = ((1, 256, 4), (1, 256, 4), (1, 256, 4, 2))
@@ -277,6 +292,58 @@ def check_models(
     require(gradients, "Backward produced no gradients")
     require(all(torch.isfinite(gradient).all() for gradient in gradients), "Backward produced NaN/Inf")
     require(any(torch.count_nonzero(gradient).item() for gradient in gradients), "All gradients are zero")
+    default_outputs = tuple(output.detach().clone() for output in outputs)
+    default_loss = loss.detach().clone()
+
+    import models.generator as generator_module
+
+    checkpoint_calls = 0
+    original_checkpoint = generator_module.activation_checkpoint
+
+    def observed_checkpoint(function, *args, **kwargs):
+        nonlocal checkpoint_calls
+        require(kwargs.get("use_reentrant") is False, "Checkpointing must be non-reentrant")
+        checkpoint_calls += 1
+        return original_checkpoint(function, *args, **kwargs)
+
+    candidate.zero_grad(set_to_none=True)
+    candidate.activation_checkpointing = True
+    torch.random.set_rng_state(rng_state)
+    generator_module.activation_checkpoint = observed_checkpoint
+    try:
+        checkpoint_outputs = candidate(noisy_mag, noisy_pha)
+        checkpoint_loss = sum(output.square().mean() for output in checkpoint_outputs)
+        checkpoint_loss.backward()
+    finally:
+        generator_module.activation_checkpoint = original_checkpoint
+        candidate.activation_checkpointing = False
+
+    expected_checkpoint_calls = 10 * candidate.num_tscblocks + 4 * candidate.num_mid_pairs
+    require(
+        checkpoint_calls == expected_checkpoint_calls,
+        f"Checkpointed {checkpoint_calls} blocks, expected {expected_checkpoint_calls}",
+    )
+    for default_output, checkpoint_output in zip(default_outputs, checkpoint_outputs):
+        require(
+            torch.allclose(default_output, checkpoint_output.detach(), rtol=1e-6, atol=1e-7),
+            "Checkpointing changed forward output values",
+        )
+    require(
+        torch.allclose(default_loss, checkpoint_loss.detach(), rtol=1e-6, atol=1e-7),
+        "Checkpointing changed the loss value",
+    )
+    checkpoint_gradients = [
+        parameter.grad for parameter in candidate.parameters() if parameter.grad is not None
+    ]
+    require(checkpoint_gradients, "Checkpoint backward produced no gradients")
+    require(
+        all(torch.isfinite(gradient).all() for gradient in checkpoint_gradients),
+        "Checkpoint backward produced NaN/Inf",
+    )
+    print(
+        f"[PASS] activation checkpointing: default off; {checkpoint_calls} non-reentrant "
+        "block calls; forward/loss parity; finite backward"
+    )
     validation_kind = "STRUCTURE-ONLY STUB" if stub_active else "RUNTIME CUDA MAMBA"
     print(
         f"[PASS] small forward/backward: shapes={expected_shapes}; finite ({validation_kind}); "
