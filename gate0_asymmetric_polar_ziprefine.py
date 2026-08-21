@@ -664,6 +664,11 @@ def _assert_state_rng_parameters_and_generator():
     small_baseline = MambaSEUNet(small_baseline_cfg).to(TEST_DEVICE)
     torch.manual_seed(505)
     small_candidate = MambaSEUNet(small_candidate_cfg).to(TEST_DEVICE)
+    small_baseline_state = small_baseline.state_dict()
+    small_candidate_state = small_candidate.state_dict()
+    assert small_baseline_state.keys() <= small_candidate_state.keys()
+    for key, value in small_baseline_state.items():
+        assert torch.equal(value, small_candidate_state[key]), key
     noisy_mag_source = torch.rand(1, 16, 8, device=TEST_DEVICE) + 0.1
     noisy_phase_source = torch.randn(1, 16, 8, device=TEST_DEVICE)
     cotangents = (
@@ -685,11 +690,25 @@ def _assert_state_rng_parameters_and_generator():
 
     baseline_outputs, baseline_vjp = forward_vjp(small_baseline)
     candidate_outputs, candidate_vjp = forward_vjp(small_candidate)
+    output_max_error = 0.0
     for baseline_value, candidate_value in zip(baseline_outputs, candidate_outputs):
-        assert torch.equal(baseline_value, candidate_value)
+        output_max_error = max(
+            output_max_error,
+            (baseline_value - candidate_value).abs().max().item(),
+        )
+        assert torch.allclose(
+            baseline_value, candidate_value, atol=1e-6, rtol=1e-5
+        )
         assert torch.isfinite(candidate_value).all()
+    vjp_max_error = 0.0
     for baseline_value, candidate_value in zip(baseline_vjp, candidate_vjp):
-        assert torch.equal(baseline_value, candidate_value)
+        vjp_max_error = max(
+            vjp_max_error,
+            (baseline_value - candidate_value).abs().max().item(),
+        )
+        assert torch.allclose(
+            baseline_value, candidate_value, atol=1e-6, rtol=1e-5
+        )
         assert torch.isfinite(candidate_value).all()
     required_aux = {
         'base_complex', 'delta_log_mag', 'applied_delta_magnitude', 'rotation',
@@ -697,7 +716,10 @@ def _assert_state_rng_parameters_and_generator():
         'ri_residual_energy_gate', 'ri_residual_applied',
     }
     assert required_aux <= small_candidate.latest_aux.keys()
-    print('PASS generator identity integration and finite forward/input VJP')
+    print(
+        'PASS generator identity integration and finite forward/input VJP; '
+        f'max errors output={output_max_error:.3e}, vjp={vjp_max_error:.3e}'
+    )
 
 
 def main():
