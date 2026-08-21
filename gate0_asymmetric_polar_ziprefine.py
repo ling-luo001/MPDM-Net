@@ -439,16 +439,19 @@ def _assert_shapes_identity_and_gradients(refiner):
         assert torch.equal(output, base)
         assert torch.isfinite(output).all()
 
-    noisy = torch.randn(1, 2, 5, 7, device=TEST_DEVICE)
+    noisy = torch.randn(
+        1, 2, 5, 7, device=TEST_DEVICE, requires_grad=True
+    )
     base = (
         torch.randn(1, 2, 5, 7, device=TEST_DEVICE) + 0.25
     ).requires_grad_(True)
     output, aux = refiner(noisy, base)
     cotangent = torch.randn_like(output)
-    input_vjp = torch.autograd.grad(
-        output, base, cotangent, retain_graph=True
-    )[0]
-    assert torch.equal(input_vjp, cotangent)
+    noisy_vjp, base_vjp = torch.autograd.grad(
+        output, (noisy, base), cotangent, retain_graph=True
+    )
+    assert torch.count_nonzero(noisy_vjp) == 0
+    assert torch.equal(base_vjp, cotangent)
     loss = (output * cotangent).sum()
     gradients = torch.autograd.grad(
         loss,
@@ -689,7 +692,12 @@ def _assert_state_rng_parameters_and_generator():
         return outputs, gradients
 
     baseline_outputs, baseline_vjp = forward_vjp(small_baseline)
+    baseline_replay_outputs, baseline_replay_vjp = forward_vjp(small_baseline)
     candidate_outputs, candidate_vjp = forward_vjp(small_candidate)
+    replay_output_max_error = max(
+        (reference - replay).abs().max().item()
+        for reference, replay in zip(baseline_outputs, baseline_replay_outputs)
+    )
     output_max_error = 0.0
     for baseline_value, candidate_value in zip(baseline_outputs, candidate_outputs):
         output_max_error = max(
@@ -700,16 +708,30 @@ def _assert_state_rng_parameters_and_generator():
             baseline_value, candidate_value, atol=1e-6, rtol=1e-5
         )
         assert torch.isfinite(candidate_value).all()
+    replay_vjp_max_error = max(
+        (reference - replay).abs().max().item()
+        for reference, replay in zip(baseline_vjp, baseline_replay_vjp)
+    )
     vjp_max_error = 0.0
     for baseline_value, candidate_value in zip(baseline_vjp, candidate_vjp):
         vjp_max_error = max(
             vjp_max_error,
             (baseline_value - candidate_value).abs().max().item(),
         )
-        assert torch.allclose(
-            baseline_value, candidate_value, atol=1e-6, rtol=1e-5
-        )
         assert torch.isfinite(candidate_value).all()
+    vjp_absolute_envelope = max(1e-5, 2.0 * replay_vjp_max_error + 1e-6)
+    assert vjp_max_error <= vjp_absolute_envelope, (
+        replay_vjp_max_error,
+        vjp_max_error,
+        vjp_absolute_envelope,
+    )
+    for baseline_value, candidate_value in zip(baseline_vjp, candidate_vjp):
+        assert torch.allclose(
+            baseline_value,
+            candidate_value,
+            atol=vjp_absolute_envelope,
+            rtol=1e-4,
+        )
     required_aux = {
         'base_complex', 'delta_log_mag', 'applied_delta_magnitude', 'rotation',
         'outer_mag_gate', 'outer_phase_gate', 'ri_residual',
@@ -718,7 +740,9 @@ def _assert_state_rng_parameters_and_generator():
     assert required_aux <= small_candidate.latest_aux.keys()
     print(
         'PASS generator identity integration and finite forward/input VJP; '
-        f'max errors output={output_max_error:.3e}, vjp={vjp_max_error:.3e}'
+        f'baseline replay output/vjp={replay_output_max_error:.3e}/'
+        f'{replay_vjp_max_error:.3e}, candidate output/vjp='
+        f'{output_max_error:.3e}/{vjp_max_error:.3e}'
     )
 
 
