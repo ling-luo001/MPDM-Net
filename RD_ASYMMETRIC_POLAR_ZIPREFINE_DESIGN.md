@@ -72,7 +72,7 @@ or checkpoint reuse. It checks configuration isolation, disabled construction,
 mutual exclusion, identity/VJP, head and outer-gate gradients, expand isolation,
 odd/even shape restoration, interaction placement and widths, checkpoint
 parity, finite forward/backward behavior, the `4,525,424` total parameter cap,
-the stricter `2 x 1,963,626` immediate-parent comparison, and state/RNG
+the stricter `2 x 1,961,130` same-build immediate-parent comparison, and state/RNG
 isolation. If selective-scan or related local dependencies are
 unavailable, the script labels and uses structural forward stubs; that result
 is not CUDA validation and does not print Gate 0 success. Structural-only runs

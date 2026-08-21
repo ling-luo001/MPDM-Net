@@ -22,9 +22,9 @@ CANDIDATE_RECIPE = (
 )
 STRUCTURAL_STUB = False
 TEST_DEVICE = None
-KNOWN_REAL_BASELINE_PARAMETERS = 1_963_626
+EXPECTED_PARENT_PARAMETERS = 1_961_130
 PARAMETER_CAP = 4_525_424
-PARENT_DOUBLE_CAP = 2 * KNOWN_REAL_BASELINE_PARAMETERS
+PARENT_DOUBLE_CAP = 2 * EXPECTED_PARENT_PARAMETERS
 
 
 def _install_import_stubs():
@@ -631,24 +631,26 @@ def _assert_state_rng_parameters_and_generator():
         assert torch.equal(value, candidate_state[key]), key
     assert torch.equal(baseline_rng, candidate_rng)
 
+    baseline_parameters = sum(parameter.numel() for parameter in baseline.parameters())
+    assert baseline_parameters == EXPECTED_PARENT_PARAMETERS, baseline_parameters
     added_parameters = sum(
         parameter.numel()
         for parameter in candidate.asymmetric_polar_zip_refiner.parameters()
     )
-    projected_total = KNOWN_REAL_BASELINE_PARAMETERS + added_parameters
+    projected_total = baseline_parameters + added_parameters
     assert projected_total <= PARAMETER_CAP, projected_total
     assert projected_total <= PARENT_DOUBLE_CAP, projected_total
     actual_total = sum(parameter.numel() for parameter in candidate.parameters())
-    if not STRUCTURAL_STUB:
-        assert actual_total == projected_total, (actual_total, projected_total)
-        assert actual_total <= PARAMETER_CAP, actual_total
-        assert actual_total <= PARENT_DOUBLE_CAP, actual_total
-    parent_ratio = projected_total / KNOWN_REAL_BASELINE_PARAMETERS
+    assert actual_total == projected_total, (actual_total, projected_total)
+    assert actual_total <= PARAMETER_CAP, actual_total
+    assert actual_total <= PARENT_DOUBLE_CAP, actual_total
+    parent_ratio = projected_total / baseline_parameters
     print(
-        f'PASS state/RNG isolation; refiner={added_parameters:,}, '
-        f'projected real total={projected_total:,} ({parent_ratio:.3f}x parent), '
+        f'PASS state/RNG isolation; parent={baseline_parameters:,}, '
+        f'refiner={added_parameters:,}, total={projected_total:,} '
+        f'({parent_ratio:.3f}x parent), '
         f'caps={PARENT_DOUBLE_CAP:,}/{PARAMETER_CAP:,}, '
-        f'local aggregate={actual_total:,}'
+        f'aggregate={actual_total:,}'
     )
 
     small_candidate_cfg = copy.deepcopy(candidate_cfg)
