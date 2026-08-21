@@ -9,6 +9,7 @@ from copy import deepcopy
 from .mamba_block import TMambaBlock, FMambaBlock, TFMambaBlock
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
 from .zip_refine_mp import ZipRefineMP
+from .asymmetric_polar_zip_refine import AsymmetricPolarZipRefine
 import torch.nn.functional as F
 
 
@@ -474,13 +475,31 @@ class MambaSEUNet(nn.Module):
         self.zip_refine_mp_enabled = bool(
             cfg['model_cfg'].get('zip_refine_mp_enabled', False)
         )
+        self.asymmetric_polar_zip_refine_enabled = bool(
+            cfg['model_cfg'].get('asymmetric_polar_zip_refine_enabled', False)
+        )
+        if (
+            self.zip_refine_mp_enabled
+            and self.asymmetric_polar_zip_refine_enabled
+        ):
+            raise ValueError(
+                'zip_refine_mp_enabled and asymmetric_polar_zip_refine_enabled '
+                'are mutually exclusive.'
+            )
         self.zip_refiner = None
+        self.asymmetric_polar_zip_refiner = None
         if self.zip_refine_mp_enabled:
             # The optional candidate must not perturb baseline initialization or
             # the caller's post-construction CPU RNG stream.
             rng_state = torch.random.get_rng_state()
             try:
                 self.zip_refiner = ZipRefineMP(cfg)
+            finally:
+                torch.random.set_rng_state(rng_state)
+        if self.asymmetric_polar_zip_refine_enabled:
+            rng_state = torch.random.get_rng_state()
+            try:
+                self.asymmetric_polar_zip_refiner = AsymmetricPolarZipRefine(cfg)
             finally:
                 torch.random.set_rng_state(rng_state)
         self.latest_aux = {}
@@ -849,6 +868,17 @@ class MambaSEUNet(nn.Module):
             base_complex_4d = torch.cat((base_real_4d, base_imag_4d), dim=1)
             refined_complex_4d, zip_refine_aux = self.zip_refiner(
                 noisy_complex_4d, base_complex_4d
+            )
+            enh_real_4d, enh_imag_4d = torch.chunk(
+                refined_complex_4d, 2, dim=1
+            )
+        elif self.asymmetric_polar_zip_refiner is not None:
+            noisy_complex_4d = torch.cat((noisy_real_4d, noisy_imag_4d), dim=1)
+            base_complex_4d = torch.cat((base_real_4d, base_imag_4d), dim=1)
+            refined_complex_4d, zip_refine_aux = (
+                self.asymmetric_polar_zip_refiner(
+                    noisy_complex_4d, base_complex_4d
+                )
             )
             enh_real_4d, enh_imag_4d = torch.chunk(
                 refined_complex_4d, 2, dim=1

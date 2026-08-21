@@ -1,0 +1,91 @@
+experiment_cfg:
+  name: rd_asymmetric_polar_ziprefine_mini_v1
+  log_name: rd_asymmetric_polar_ziprefine_mini_v1
+
+env_setting:
+  num_gpus: 1
+  num_workers: 4
+  seed: 1234
+  stdout_interval: 200
+  checkpoint_interval: 2000
+  validation_interval: 2000
+  summary_interval: 200
+  dist_cfg:
+    dist_backend: nccl
+    dist_url: tcp://localhost:29518
+    world_size: 1
+
+data_cfg:
+  train_clean_json: data/train_clean.json
+  train_noisy_json: data/train_noisy.json
+  valid_clean_json: data/valid_clean.json
+  valid_noisy_json: data/valid_noisy.json
+  test_clean_json: data/test_clean.json
+  test_noisy_json: data/test_noisy.json
+
+training_cfg:
+  training_epochs: 400
+  batch_size: 2
+  learning_rate: 0.0005
+  adam_b1: 0.8
+  adam_b2: 0.99
+  max_grad_norm: 5.0
+  lr_decay: 0.99
+  segment_size: 30600
+  loss:
+    metric: 0.05
+    magnitude: 0.9
+    phase: 0.3
+    complex: 0.1
+    time: 0.2
+    consistancy: 0.1
+    coarse_complex: 0.1
+    pitch: 0.02
+    voicing: 0.05
+    harmonic_support: 0.01
+  use_PCS400: False
+
+stft_cfg:
+  sampling_rate: 16000
+  n_fft: 510
+  hop_size: 120
+  win_size: 510
+
+model_cfg:
+  hid_feature: 16
+  dense_channel: 16
+  compress_factor: 0.3
+  num_tfmamba: 2
+  d_state: 16
+  d_conv: 4
+  expand: 4
+  norm_epsilon: 0.00001
+  phase_eps: 0.001
+  restoration_width_ratio: 1.0
+  dense_bridge_width_ratio: 0.5
+  complex_residual_gate_bias: -2.0
+  deep_filter_offsets: [-2, -1, 1, 2]
+  deep_filter_gate_bias: -2.0
+  pitch_candidates: 64
+  pitch_min_f0: 60.0
+  pitch_max_f0: 500.0
+  pitch_temperature: 0.1
+  pitch_smoothing_bins: 9
+  harmonic_bandwidth_bins: 0.75
+  voicing_gate_bias: -1.0
+  voicing_confidence_power: 0.5
+  beta: 2.0
+  input_channel: 2
+  output_channel: 1
+  num_mid_pairs: 3
+  asymmetric_polar_zip_refine_enabled: true
+  asymmetric_polar_zip_refine_activation_checkpointing: true
+  asymmetric_polar_zip_refine_mag_channels: 80
+  asymmetric_polar_zip_refine_phase_channels: 40
+  asymmetric_polar_zip_refine_stage_common_channels: [0, 64, 64, 40]
+  asymmetric_polar_zip_refine_expand: 2
+  asymmetric_polar_zip_refine_eps: 0.000001
+  asymmetric_polar_zip_refine_delta_limit: 1.0
+  asymmetric_polar_zip_refine_interaction_gate_bias: -2.0
+  asymmetric_polar_zip_refine_complex_residual_scale: 0.1
+  asymmetric_polar_zip_refine_complex_residual_gate_bias: -2.0
