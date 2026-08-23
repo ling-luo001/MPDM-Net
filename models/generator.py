@@ -13,6 +13,15 @@ from .asymmetric_polar_zip_refine import AsymmetricPolarZipRefine
 import torch.nn.functional as F
 
 
+def apply_asymmetric_polar_zip_refiner_oneway_anchor(
+    refiner, noisy_complex, base_complex
+):
+    """Apply a value-equivalent refiner with an identity VJP to S0."""
+    anchor = base_complex.detach()
+    refined_anchor, aux = refiner(noisy_complex, anchor)
+    return refined_anchor + (base_complex - anchor), aux
+
+
 #####################################
 class DWConv2d_BN(nn.Module):
 
@@ -478,6 +487,19 @@ class MambaSEUNet(nn.Module):
         self.asymmetric_polar_zip_refine_enabled = bool(
             cfg['model_cfg'].get('asymmetric_polar_zip_refine_enabled', False)
         )
+        self.asymmetric_polar_zip_refine_oneway_anchor = bool(
+            cfg['model_cfg'].get(
+                'asymmetric_polar_zip_refine_oneway_anchor', False
+            )
+        )
+        if (
+            self.asymmetric_polar_zip_refine_oneway_anchor
+            and not self.asymmetric_polar_zip_refine_enabled
+        ):
+            raise ValueError(
+                'asymmetric_polar_zip_refine_oneway_anchor requires the '
+                'asymmetric refiner.'
+            )
         if (
             self.zip_refine_mp_enabled
             and self.asymmetric_polar_zip_refine_enabled
@@ -875,11 +897,20 @@ class MambaSEUNet(nn.Module):
         elif self.asymmetric_polar_zip_refiner is not None:
             noisy_complex_4d = torch.cat((noisy_real_4d, noisy_imag_4d), dim=1)
             base_complex_4d = torch.cat((base_real_4d, base_imag_4d), dim=1)
-            refined_complex_4d, zip_refine_aux = (
-                self.asymmetric_polar_zip_refiner(
-                    noisy_complex_4d, base_complex_4d
+            if self.asymmetric_polar_zip_refine_oneway_anchor:
+                refined_complex_4d, zip_refine_aux = (
+                    apply_asymmetric_polar_zip_refiner_oneway_anchor(
+                        self.asymmetric_polar_zip_refiner,
+                        noisy_complex_4d,
+                        base_complex_4d,
+                    )
                 )
-            )
+            else:
+                refined_complex_4d, zip_refine_aux = (
+                    self.asymmetric_polar_zip_refiner(
+                        noisy_complex_4d, base_complex_4d
+                    )
+                )
             enh_real_4d, enh_imag_4d = torch.chunk(
                 refined_complex_4d, 2, dim=1
             )

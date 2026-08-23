@@ -498,6 +498,60 @@ def train(rank, args, cfg):
                         aux_snapshot['transition_residual_scales'].abs().mean().item(),
                         steps
                     )
+                    if 'asymmetric_mag_stage_scales' in aux_snapshot:
+                        interaction_scales = torch.cat((
+                            aux_snapshot['asymmetric_interaction_mag_scales'],
+                            aux_snapshot['asymmetric_interaction_phase_scales'],
+                        ))
+                        applied_delta_abs = aux_snapshot[
+                            'applied_delta_log_mag'
+                        ].detach().abs().float().reshape(-1)
+                        sw.add_scalar(
+                            "Training/Asymmetric Mag Stage Scale",
+                            aux_snapshot['asymmetric_mag_stage_scales'].abs().mean().item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric Phase Stage Scale",
+                            aux_snapshot['asymmetric_phase_stage_scales'].abs().mean().item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric Interaction Scale",
+                            interaction_scales.abs().mean().item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric Dense Bridge Scale",
+                            aux_snapshot['asymmetric_dense_bridge_scale'].item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric Outer Mag Gate",
+                            aux_snapshot['outer_mag_gate'].item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric Outer Phase Gate",
+                            aux_snapshot['outer_phase_gate'].item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric Applied Log-Mag Delta Activity",
+                            applied_delta_abs.mean().item(),
+                            steps
+                        )
+                        for quantile, suffix in ((0.5, 'P50'), (0.9, 'P90'), (0.99, 'P99')):
+                            sw.add_scalar(
+                                f"Training/Asymmetric Applied Log-Mag Delta {suffix}",
+                                torch.quantile(applied_delta_abs, quantile).item(),
+                                steps
+                            )
+                        sw.add_scalar(
+                            "Training/Asymmetric RI Residual Activity",
+                            aux_snapshot['ri_residual_applied'].abs().mean().item(),
+                            steps
+                        )
 
                 # If NaN happend in training period, RaiseError
                 if torch.isnan(loss_gen_all).any():

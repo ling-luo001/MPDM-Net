@@ -1,4 +1,4 @@
-"""Local Gate 0 for RD-Asymmetric-Polar-ZipRefine.
+"""Local Gate 0 for RD-Asymmetric-Polar-Anchor-Dense.
 
 This script does not train or read checkpoints. If native selective-scan or
 other local runtime dependencies are unavailable, it installs explicitly
@@ -15,15 +15,20 @@ import types
 
 
 ROOT = pathlib.Path(__file__).resolve().parent
-RD_ZIP_RECIPE = ROOT / 'recipes' / 'RD-ZipRefine-MP' / 'RD-ZipRefine-MP.yaml'
-CANDIDATE_RECIPE = (
+REFERENCE_RECIPE = (
     ROOT / 'recipes' / 'RD-Asymmetric-Polar-ZipRefine'
     / 'RD-Asymmetric-Polar-ZipRefine.yaml'
+)
+CANDIDATE_RECIPE = (
+    ROOT / 'recipes' / 'RD-Asymmetric-Polar-Anchor-Dense'
+    / 'RD-Asymmetric-Polar-Anchor-Dense.yaml'
 )
 STRUCTURAL_STUB = False
 TEST_DEVICE = None
 EXPECTED_PARENT_PARAMETERS = 1_961_130
-PARAMETER_CAP = 4_525_424
+EXPECTED_LEGACY_ASYMMETRIC_PARAMETERS = 3_704_890
+EXPECTED_BRIDGE_PARAMETERS = 5_381
+EXPECTED_CANDIDATE_PARAMETERS = 3_710_271
 PARENT_DOUBLE_CAP = 2 * EXPECTED_PARENT_PARAMETERS
 
 
@@ -229,42 +234,35 @@ def _baseline_cfg():
     return cfg
 
 
+def _legacy_cfg():
+    return _load_yaml(REFERENCE_RECIPE)
+
+
 def _assert_config_control():
-    reference = _load_yaml(RD_ZIP_RECIPE)
+    reference = _legacy_cfg()
     candidate = _actual_cfg()
     differences = _diff_paths(reference, candidate)
     allowed = {
         'experiment_cfg.name',
         'experiment_cfg.log_name',
         'env_setting.dist_cfg.dist_url',
-        'model_cfg.zip_refine_mp_enabled',
-        'model_cfg.zip_refine_mp_activation_checkpointing',
-        'model_cfg.zip_refine_mp_channels',
-        'model_cfg.zip_refine_mp_eps',
-        'model_cfg.zip_refine_mp_delta_limit',
-        'model_cfg.asymmetric_polar_zip_refine_enabled',
-        'model_cfg.asymmetric_polar_zip_refine_activation_checkpointing',
-        'model_cfg.asymmetric_polar_zip_refine_mag_channels',
-        'model_cfg.asymmetric_polar_zip_refine_phase_channels',
-        'model_cfg.asymmetric_polar_zip_refine_stage_common_channels',
-        'model_cfg.asymmetric_polar_zip_refine_expand',
-        'model_cfg.asymmetric_polar_zip_refine_eps',
-        'model_cfg.asymmetric_polar_zip_refine_delta_limit',
-        'model_cfg.asymmetric_polar_zip_refine_interaction_gate_bias',
-        'model_cfg.asymmetric_polar_zip_refine_complex_residual_scale',
-        'model_cfg.asymmetric_polar_zip_refine_complex_residual_gate_bias',
+        'model_cfg.asymmetric_polar_zip_refine_oneway_anchor',
+        'model_cfg.asymmetric_polar_zip_refine_compressed_dense_bridge_enabled',
     }
     assert differences == allowed, (differences, allowed)
     assert candidate['data_cfg'] == reference['data_cfg']
     assert candidate['training_cfg'] == reference['training_cfg']
     assert candidate['stft_cfg'] == reference['stft_cfg']
     assert candidate['model_cfg']['expand'] == 4
-    assert 'zip_refine_mp_enabled' not in candidate['model_cfg']
+    assert candidate['model_cfg']['asymmetric_polar_zip_refine_oneway_anchor'] is True
+    assert candidate['model_cfg'][
+        'asymmetric_polar_zip_refine_compressed_dense_bridge_enabled'
+    ] is True
     forbidden = ('torch.load', 'load_state_dict', 'resume_from', 'pretrained', '.pth')
     for relative in (
         'models/asymmetric_polar_zip_refine.py',
         'models/generator.py',
-        'recipes/RD-Asymmetric-Polar-ZipRefine/RD-Asymmetric-Polar-ZipRefine.yaml',
+        'recipes/RD-Asymmetric-Polar-Anchor-Dense/RD-Asymmetric-Polar-Anchor-Dense.yaml',
     ):
         source = (ROOT / relative).read_text(encoding='utf-8').lower()
         assert not any(token in source for token in forbidden), relative
@@ -289,8 +287,8 @@ def _assert_config_control():
     assert set(mini_valid_clean) <= set(valid_clean)
     assert set(mini_valid_noisy) <= set(valid_noisy)
     print(
-        'PASS config changes restricted; full validation=824, mini validation=165 '
-        'paired subset; training settings unchanged'
+        'PASS exact five-path config whitelist; full validation=824, mini '
+        'validation=165 paired subset; training/loss/STFT settings unchanged'
     )
 
 
@@ -324,6 +322,20 @@ def _assert_switches_and_contract():
     assert len(interactions) == 3
     assert [module.common_channels for module in interactions] == [64, 64, 40]
     assert len({id(module) for module in interactions}) == 3
+    assert refiner.compressed_dense_bridge_enabled is True
+    assert refiner.compressed_mag_dense_bridge is not None
+    assert sum(
+        stage.compressed_mag_dense_bridge is not None
+        for stage in refiner.paired_stages
+    ) == 1
+    assert refiner.paired_stages[2].compressed_mag_dense_bridge is (
+        refiner.compressed_mag_dense_bridge
+    )
+    assert all(
+        stage.compressed_mag_dense_bridge is None
+        for index, stage in enumerate(refiner.paired_stages)
+        if index != 2
+    )
     for interaction in interactions:
         assert isinstance(interaction.cross, _AlignedSS2DCross)
         assert torch.count_nonzero(interaction.mag_cross_gate.weight) == 0
@@ -368,7 +380,14 @@ def _assert_switches_and_contract():
         assert 'mutually exclusive' in str(error)
     else:
         raise AssertionError('mutually exclusive refiners were accepted')
-    print('PASS disabled construction, mutual exclusion, widths/order/placement, expand isolation')
+    assert all(
+        stage.phase_path is not refiner.compressed_mag_dense_bridge
+        for stage in refiner.paired_stages
+    )
+    print(
+        'PASS disabled construction, mutual exclusion, widths/order/placement, '
+        'single magnitude-only Stage-2->Stage-3 bridge, expand isolation'
+    )
     return refiner
 
 
@@ -416,6 +435,129 @@ def _assert_bidirectional_exchange(refiner):
     assert torch.isfinite(phase_to_mag).all()
     assert torch.isfinite(mag_to_phase).all()
     print('PASS explicit phase-to-mag and mag-to-phase feature transfer')
+
+
+def _assert_switch_off_equivalence_and_anchor():
+    import torch
+    from models.asymmetric_polar_zip_refine import AsymmetricPolarZipRefine
+    from models.generator import apply_asymmetric_polar_zip_refiner_oneway_anchor
+
+    legacy_cfg = _legacy_cfg()
+    switches_off_cfg = copy.deepcopy(_actual_cfg())
+    switches_off_cfg['model_cfg'][
+        'asymmetric_polar_zip_refine_oneway_anchor'
+    ] = False
+    switches_off_cfg['model_cfg'][
+        'asymmetric_polar_zip_refine_compressed_dense_bridge_enabled'
+    ] = False
+    torch.manual_seed(181)
+    legacy = AsymmetricPolarZipRefine(legacy_cfg).to(TEST_DEVICE).eval()
+    legacy_rng = torch.random.get_rng_state().clone()
+    torch.manual_seed(181)
+    switches_off = AsymmetricPolarZipRefine(
+        switches_off_cfg
+    ).to(TEST_DEVICE).eval()
+    switches_off_rng = torch.random.get_rng_state().clone()
+    assert legacy.state_dict().keys() == switches_off.state_dict().keys()
+    for key, value in legacy.state_dict().items():
+        assert torch.equal(value, switches_off.state_dict()[key]), key
+    assert torch.equal(legacy_rng, switches_off_rng)
+    noisy = torch.randn(1, 2, 5, 7, device=TEST_DEVICE)
+    base = torch.randn(1, 2, 5, 7, device=TEST_DEVICE)
+    legacy_output, legacy_aux = legacy(noisy, base)
+    off_output, off_aux = switches_off(noisy, base)
+    assert torch.equal(legacy_output, off_output)
+    assert legacy_aux.keys() == off_aux.keys()
+    for key in legacy_aux:
+        assert torch.equal(legacy_aux[key], off_aux[key]), key
+
+    torch.manual_seed(182)
+    anchored = AsymmetricPolarZipRefine(_actual_cfg()).to(TEST_DEVICE).train()
+    with torch.no_grad():
+        anchored.outer_mag_gate.fill_(0.2)
+        anchored.outer_phase_gate.fill_(-0.15)
+        anchored.ri_residual_head[-1].weight.fill_(1e-3)
+        anchored.ri_residual_head[-1].bias.fill_(2e-4)
+        anchored.ri_residual_gate.weight.fill_(1e-3)
+        anchored.compressed_mag_dense_bridge.residual_scale.fill_(0.1)
+    noisy = torch.randn(1, 2, 5, 7, device=TEST_DEVICE)
+    base_value = torch.randn(1, 2, 5, 7, device=TEST_DEVICE)
+    joint_output, _ = anchored(noisy, base_value)
+    base = base_value.clone().requires_grad_(True)
+    anchor_output, _ = apply_asymmetric_polar_zip_refiner_oneway_anchor(
+        anchored, noisy, base
+    )
+    assert torch.equal(anchor_output, joint_output)
+    cotangent = torch.randn_like(anchor_output)
+    base_vjp = torch.autograd.grad(
+        anchor_output, base, cotangent, retain_graph=True
+    )[0]
+    assert torch.equal(base_vjp, cotangent)
+    anchored.zero_grad(set_to_none=True)
+    (anchor_output * cotangent).sum().backward()
+    parameter_gradients = [
+        parameter.grad for parameter in anchored.parameters()
+        if parameter.grad is not None
+    ]
+    assert parameter_gradients
+    assert all(torch.isfinite(gradient).all() for gradient in parameter_gradients)
+    assert sum(gradient.abs().sum() for gradient in parameter_gradients) > 0
+    assert anchored.mag_stem[0].weight.grad.abs().sum() > 0
+    assert anchored.compressed_mag_dense_bridge.fusion[1].weight.grad.abs().sum() > 0
+    print(
+        'PASS switches-off legacy state/RNG/forward equivalence; nonzero anchor '
+        'forward matches joint, S0 VJP is exact identity, refiner gradients finite/nonzero'
+    )
+
+
+def _assert_dense_bridge_contract(refiner):
+    import torch
+
+    bridge = refiner.compressed_mag_dense_bridge
+    parameter_count = sum(parameter.numel() for parameter in bridge.parameters())
+    assert parameter_count == EXPECTED_BRIDGE_PARAMETERS, parameter_count
+    assert torch.count_nonzero(bridge.residual_scale) == 0
+    target = torch.randn(
+        1, 80, 3, 4, device=TEST_DEVICE, requires_grad=True
+    )
+    context = torch.randn(
+        1, 80, 3, 4, device=TEST_DEVICE, requires_grad=True
+    )
+    output = bridge(target, context)
+    assert torch.equal(output, target)
+    cotangent = torch.randn_like(output)
+    target_vjp, context_vjp = torch.autograd.grad(
+        output, (target, context), cotangent
+    )
+    assert torch.equal(target_vjp, cotangent)
+    assert torch.count_nonzero(context_vjp) == 0
+
+    with torch.no_grad():
+        bridge.residual_scale.fill_(0.2)
+    target = target.detach().requires_grad_(True)
+    context = context.detach().requires_grad_(True)
+    opened_output = bridge(target, context)
+    opened_context_vjp = torch.autograd.grad(
+        (opened_output * cotangent).sum(), context
+    )[0]
+    assert torch.isfinite(opened_context_vjp).all()
+    assert opened_context_vjp.abs().sum() > 0
+    for invalid_context in (
+        torch.randn(1, 79, 3, 4, device=TEST_DEVICE),
+        torch.randn(1, 80, 2, 4, device=TEST_DEVICE),
+    ):
+        try:
+            bridge(target.detach(), invalid_context)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Dense bridge accepted an invalid context shape.')
+    with torch.no_grad():
+        bridge.residual_scale.zero_()
+    print(
+        'PASS dense bridge alpha=0 identity/VJP, opened context gradient, strict '
+        f'shapes, exact parameters={parameter_count:,}'
+    )
 
 
 def _assert_shapes_identity_and_gradients(refiner):
@@ -618,10 +760,14 @@ def _assert_state_rng_parameters_and_generator():
     from models.generator import MambaSEUNet
 
     baseline_cfg = _baseline_cfg()
+    legacy_cfg = _legacy_cfg()
     candidate_cfg = _actual_cfg()
     torch.manual_seed(404)
     baseline = MambaSEUNet(baseline_cfg)
     baseline_rng = torch.random.get_rng_state().clone()
+    torch.manual_seed(404)
+    legacy = MambaSEUNet(legacy_cfg)
+    legacy_rng = torch.random.get_rng_state().clone()
     torch.manual_seed(404)
     candidate = MambaSEUNet(candidate_cfg)
     candidate_rng = torch.random.get_rng_state().clone()
@@ -633,26 +779,34 @@ def _assert_state_rng_parameters_and_generator():
     for key, value in baseline_state.items():
         assert torch.equal(value, candidate_state[key]), key
     assert torch.equal(baseline_rng, candidate_rng)
+    legacy_state = legacy.state_dict()
+    assert legacy_state.keys() <= candidate_state.keys()
+    for key, value in legacy_state.items():
+        assert torch.equal(value, candidate_state[key]), key
+    assert torch.equal(legacy_rng, candidate_rng)
 
     baseline_parameters = sum(parameter.numel() for parameter in baseline.parameters())
     assert baseline_parameters == EXPECTED_PARENT_PARAMETERS, baseline_parameters
+    legacy_parameters = sum(parameter.numel() for parameter in legacy.parameters())
+    assert legacy_parameters == EXPECTED_LEGACY_ASYMMETRIC_PARAMETERS, legacy_parameters
     added_parameters = sum(
         parameter.numel()
         for parameter in candidate.asymmetric_polar_zip_refiner.parameters()
     )
     projected_total = baseline_parameters + added_parameters
-    assert projected_total <= PARAMETER_CAP, projected_total
+    assert projected_total == EXPECTED_CANDIDATE_PARAMETERS, projected_total
+    assert projected_total - legacy_parameters == EXPECTED_BRIDGE_PARAMETERS
     assert projected_total <= PARENT_DOUBLE_CAP, projected_total
     actual_total = sum(parameter.numel() for parameter in candidate.parameters())
     assert actual_total == projected_total, (actual_total, projected_total)
-    assert actual_total <= PARAMETER_CAP, actual_total
     assert actual_total <= PARENT_DOUBLE_CAP, actual_total
     parent_ratio = projected_total / baseline_parameters
     print(
         f'PASS state/RNG isolation; parent={baseline_parameters:,}, '
         f'refiner={added_parameters:,}, total={projected_total:,} '
         f'({parent_ratio:.3f}x parent), '
-        f'caps={PARENT_DOUBLE_CAP:,}/{PARAMETER_CAP:,}, '
+        f'legacy={legacy_parameters:,}, bridge={EXPECTED_BRIDGE_PARAMETERS:,}, '
+        f'2x-parent-cap={PARENT_DOUBLE_CAP:,}, '
         f'aggregate={actual_total:,}'
     )
 
@@ -736,6 +890,10 @@ def _assert_state_rng_parameters_and_generator():
         'base_complex', 'delta_log_mag', 'applied_delta_magnitude', 'rotation',
         'outer_mag_gate', 'outer_phase_gate', 'ri_residual',
         'ri_residual_energy_gate', 'ri_residual_applied',
+        'asymmetric_mag_stage_scales', 'asymmetric_phase_stage_scales',
+        'asymmetric_interaction_mag_scales',
+        'asymmetric_interaction_phase_scales',
+        'asymmetric_dense_bridge_scale',
     }
     assert required_aux <= small_candidate.latest_aux.keys()
     print(
@@ -767,6 +925,8 @@ def main():
     refiner = _assert_switches_and_contract()
     _assert_directional_alignment()
     _assert_bidirectional_exchange(refiner)
+    _assert_switch_off_equivalence_and_anchor()
+    _assert_dense_bridge_contract(refiner)
     _assert_shapes_identity_and_gradients(refiner)
     _assert_checkpoint_parity()
     _assert_state_rng_parameters_and_generator()

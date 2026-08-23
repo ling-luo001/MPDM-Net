@@ -251,11 +251,60 @@ class _ProjectedCrossInteraction(nn.Module):
         )
 
 
+class _CompressedMagnitudeDenseBridge(nn.Module):
+    """Fuse Stage-2 context into Stage-3 in the 80-channel zip domain."""
+
+    channels = 80
+    hidden_channels = 20
+
+    def __init__(self):
+        super().__init__()
+        self.fusion = nn.Sequential(
+            nn.GroupNorm(1, self.channels * 2),
+            nn.Conv2d(self.channels * 2, self.hidden_channels, 1, bias=False),
+            nn.PReLU(self.hidden_channels),
+            nn.Conv2d(
+                self.hidden_channels,
+                self.hidden_channels,
+                3,
+                padding=1,
+                groups=self.hidden_channels,
+                bias=False,
+            ),
+            nn.GroupNorm(1, self.hidden_channels),
+            nn.PReLU(self.hidden_channels),
+            nn.Conv2d(self.hidden_channels, self.channels, 1, bias=False),
+        )
+        self.residual_scale = nn.Parameter(torch.zeros(()))
+
+    def forward(self, target, context):
+        expected_channels = self.channels
+        for name, value in (('target', target), ('context', context)):
+            if value.ndim != 4 or value.shape[1] != expected_channels:
+                raise ValueError(
+                    f'{name} must have shape [B, {expected_channels}, H, W], '
+                    f'got {tuple(value.shape)}.'
+                )
+        if target.shape != context.shape:
+            raise ValueError(
+                f'Compressed dense bridge shapes differ: {tuple(target.shape)} '
+                f'vs {tuple(context.shape)}.'
+            )
+        fused = self.fusion(torch.cat((target, context), dim=1))
+        if fused.shape != target.shape:
+            raise RuntimeError(
+                f'Compressed dense bridge output shape mismatch: '
+                f'{tuple(fused.shape)} != {tuple(target.shape)}.'
+            )
+        return target + torch.tanh(self.residual_scale) * fused
+
+
 class _PairedStage(nn.Module):
     """Run both asymmetric paths and interact at the specified stage position."""
 
     def __init__(
-        self, cfg, mag_channels, phase_channels, ratio, common_channels=None
+        self, cfg, mag_channels, phase_channels, ratio, common_channels=None,
+        compressed_dense_bridge_enabled=False,
     ):
         super().__init__()
         self.ratio = ratio
@@ -280,13 +329,33 @@ class _PairedStage(nn.Module):
             else 'compressed_pre_up' if ratio == 2
             else 'full_resolution'
         )
+        self.compressed_mag_dense_bridge = None
+        if compressed_dense_bridge_enabled:
+            if ratio != 2 or mag_channels != 80:
+                raise ValueError(
+                    'The approved dense bridge requires a ratio-2, 80-channel '
+                    'magnitude stage.'
+                )
+            rng_state = torch.random.get_rng_state()
+            try:
+                self.compressed_mag_dense_bridge = (
+                    _CompressedMagnitudeDenseBridge()
+                )
+            finally:
+                torch.random.set_rng_state(rng_state)
 
-    def forward(self, mag_features, phase_features):
+    def _forward_impl(self, mag_features, phase_features, mag_dense_context=None):
         mag_residual, mag_same = self.mag_path.encode(mag_features)
         phase_residual, phase_same = self.phase_path.encode(phase_features)
         if self.interaction is not None:
             mag_residual, phase_residual = self.interaction(
                 mag_residual, phase_residual
+            )
+        if self.compressed_mag_dense_bridge is not None:
+            if mag_dense_context is None:
+                raise ValueError('Stage-3 dense bridge requires Stage-2 context.')
+            mag_residual = self.compressed_mag_dense_bridge(
+                mag_residual, mag_dense_context
             )
         mag_output = self.mag_path.restore(
             mag_features, mag_residual, mag_same
@@ -294,7 +363,20 @@ class _PairedStage(nn.Module):
         phase_output = self.phase_path.restore(
             phase_features, phase_residual, phase_same
         )
+        return mag_output, phase_output, mag_residual
+
+    def forward(self, mag_features, phase_features):
+        mag_output, phase_output, _ = self._forward_impl(
+            mag_features, phase_features
+        )
         return mag_output, phase_output
+
+    def forward_with_compressed_state(
+        self, mag_features, phase_features, mag_dense_context=None
+    ):
+        return self._forward_impl(
+            mag_features, phase_features, mag_dense_context
+        )
 
 
 class AsymmetricPolarZipRefine(nn.Module):
@@ -340,6 +422,12 @@ class AsymmetricPolarZipRefine(nn.Module):
                 'asymmetric_polar_zip_refine_activation_checkpointing', False
             )
         )
+        self.compressed_dense_bridge_enabled = bool(
+            model_cfg.get(
+                'asymmetric_polar_zip_refine_compressed_dense_bridge_enabled',
+                False,
+            )
+        )
         if self.mag_channels != 80 or self.phase_channels != 40:
             raise ValueError('The approved asymmetric widths are magnitude=80, phase=40.')
         if self.stage_common_channels != (0, 64, 64, 40):
@@ -376,12 +464,14 @@ class AsymmetricPolarZipRefine(nn.Module):
                 self.phase_channels,
                 ratio,
                 common_channels or None,
+                compressed_dense_bridge_enabled=(
+                    self.compressed_dense_bridge_enabled and stage_index == 2
+                ),
             )
-            for ratio, common_channels in zip(
+            for stage_index, (ratio, common_channels) in enumerate(zip(
                 self.compression_ratios, self.stage_common_channels
-            )
+            ))
         ])
-
         self.delta_log_mag_head = nn.Conv2d(self.mag_channels, 1, 1)
         self.rotation_head = nn.Conv2d(self.phase_channels, 2, 1)
         self.outer_mag_gate = nn.Parameter(torch.zeros(()))
@@ -408,12 +498,27 @@ class AsymmetricPolarZipRefine(nn.Module):
             self.ri_residual_gate.bias, self.complex_residual_gate_bias
         )
 
+    @property
+    def compressed_mag_dense_bridge(self):
+        return self.paired_stages[2].compressed_mag_dense_bridge
+
     def _run_stage(self, stage, mag_features, phase_features):
         if self.activation_checkpointing and self.training and torch.is_grad_enabled():
             return checkpoint(
                 stage, mag_features, phase_features, use_reentrant=False
             )
         return stage(mag_features, phase_features)
+
+    def _run_stage_with_compressed_state(
+        self, stage, mag_features, phase_features, mag_dense_context=None
+    ):
+        function = stage.forward_with_compressed_state
+        arguments = [mag_features, phase_features]
+        if mag_dense_context is not None:
+            arguments.append(mag_dense_context)
+        if self.activation_checkpointing and self.training and torch.is_grad_enabled():
+            return checkpoint(function, *arguments, use_reentrant=False)
+        return function(*arguments)
 
     def build_eight_map_input(self, noisy_complex, base_complex):
         for name, value in (
@@ -446,9 +551,30 @@ class AsymmetricPolarZipRefine(nn.Module):
 
         mag_features = self.mag_stem(maps)
         phase_features = self.phase_stem(maps)
-        for stage in self.paired_stages:
+        if not self.compressed_dense_bridge_enabled:
+            for stage in self.paired_stages:
+                mag_features, phase_features = self._run_stage(
+                    stage, mag_features, phase_features
+                )
+        else:
             mag_features, phase_features = self._run_stage(
-                stage, mag_features, phase_features
+                self.paired_stages[0], mag_features, phase_features
+            )
+            mag_features, phase_features, stage2_compressed = (
+                self._run_stage_with_compressed_state(
+                    self.paired_stages[1], mag_features, phase_features
+                )
+            )
+            mag_features, phase_features, _ = (
+                self._run_stage_with_compressed_state(
+                    self.paired_stages[2],
+                    mag_features,
+                    phase_features,
+                    stage2_compressed,
+                )
+            )
+            mag_features, phase_features = self._run_stage(
+                self.paired_stages[3], mag_features, phase_features
             )
 
         bounded_delta = self.delta_limit * torch.tanh(
@@ -526,5 +652,30 @@ class AsymmetricPolarZipRefine(nn.Module):
             'ri_residual_energy_gate': energy_gate,
             'ri_residual_gate': residual_gate,
             'ri_residual_applied': applied_ri_residual,
+            'asymmetric_mag_stage_scales': torch.stack([
+                torch.tanh(stage.mag_path.residual_scale)
+                for stage in self.paired_stages
+            ]),
+            'asymmetric_phase_stage_scales': torch.stack([
+                torch.tanh(stage.phase_path.residual_scale)
+                for stage in self.paired_stages
+            ]),
+            'asymmetric_interaction_mag_scales': torch.stack([
+                torch.tanh(stage.interaction.mag_scale)
+                for stage in self.paired_stages
+                if stage.interaction is not None
+            ]),
+            'asymmetric_interaction_phase_scales': torch.stack([
+                torch.tanh(stage.interaction.phase_scale)
+                for stage in self.paired_stages
+                if stage.interaction is not None
+            ]),
+            'asymmetric_dense_bridge_scale': (
+                torch.tanh(
+                    self.compressed_mag_dense_bridge.residual_scale
+                )
+                if self.compressed_mag_dense_bridge is not None
+                else base_complex.new_zeros(())
+            ),
         }
         return refined_complex, aux
