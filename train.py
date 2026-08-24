@@ -23,7 +23,7 @@ from models.generator import MambaSEUNet
 from models.loss import pesq_score, phase_losses
 from models.discriminator import MetricDiscriminator, batch_pesq
 from utils.util import (
-    load_ckpts, load_optimizer_states, save_checkpoint,
+    load_checkpoint, load_ckpts, load_optimizer_states, save_checkpoint,
     build_env, load_config, initialize_seed, 
     print_gpu_info, log_model_info, initialize_process_group,
 )
@@ -89,14 +89,221 @@ def harmonic_generation_losses(generator, clean_mag, clean_com):
     }
 
 
+def asymmetric_refiner_losses(generator, clean_mag, clean_com):
+    """Directly supervise the residual demand and each serial correction step."""
+    refiner = getattr(generator, 'asymmetric_polar_zip_refiner', None)
+    if refiner is None:
+        zero = clean_mag.new_zeros(())
+        return {
+            'base_complex': zero,
+            'magnitude': zero,
+            'phase': zero,
+            'polar_complex': zero,
+            'ri_residual': zero,
+            'demand': zero,
+        }
+
+    aux = generator.latest_aux
+    required_keys = {
+        'base_complex',
+        'parent_base_complex',
+        'corrected_magnitude',
+        'applied_phase_delta',
+        'polar_complex',
+        'mag_demand_gate',
+        'phase_demand_gate',
+        'ri_demand_gate',
+        'ri_residual_applied',
+    }
+    missing = required_keys.difference(aux)
+    if missing:
+        raise RuntimeError(
+            f'Missing asymmetric-refiner auxiliary outputs: {sorted(missing)}'
+        )
+    if clean_com.ndim != 4 or clean_com.shape[-1] != 2:
+        raise ValueError(
+            f'clean_com must have shape [B, F, T, 2], got {tuple(clean_com.shape)}.'
+        )
+
+    eps = float(getattr(refiner, 'eps', 1e-6))
+    clean_complex = clean_com.permute(0, 3, 2, 1).contiguous()
+    clean_magnitude = clean_mag.permute(0, 2, 1).unsqueeze(1).contiguous()
+    base_complex = aux['base_complex']
+    parent_base_complex = aux['parent_base_complex']
+    base_magnitude = torch.linalg.vector_norm(
+        base_complex, dim=1, keepdim=True
+    )
+    polar_complex = aux['polar_complex']
+    polar_magnitude = torch.linalg.vector_norm(
+        polar_complex, dim=1, keepdim=True
+    )
+
+    loss_base_complex = F.mse_loss(parent_base_complex, clean_complex) * 2
+    loss_magnitude = F.smooth_l1_loss(
+        aux['corrected_magnitude'], clean_magnitude
+    )
+
+    base_real, base_imag = torch.chunk(base_complex, 2, dim=1)
+    clean_real, clean_imag = torch.chunk(clean_complex, 2, dim=1)
+    target_phase_delta = torch.atan2(
+        base_real * clean_imag - base_imag * clean_real,
+        base_real * clean_real + base_imag * clean_imag,
+    ).detach()
+    phase_confidence = (
+        2.0 * base_magnitude * clean_magnitude
+        / (base_magnitude.square() + clean_magnitude.square() + eps)
+    ).detach()
+    phase_error = 1.0 - torch.cos(
+        aux['applied_phase_delta'] - target_phase_delta
+    )
+    loss_phase = (
+        phase_error * phase_confidence
+    ).sum() / phase_confidence.sum().clamp_min(eps)
+
+    loss_polar_complex = F.mse_loss(polar_complex, clean_complex) * 2
+    remaining_residual = (clean_complex - polar_complex).detach()
+    loss_ri_residual = F.smooth_l1_loss(
+        aux['ri_residual_applied'], remaining_residual
+    )
+
+    magnitude_demand_target = (
+        (clean_magnitude - base_magnitude).abs()
+        / (clean_magnitude + base_magnitude + eps)
+    ).detach().clamp(0.0, 1.0)
+    phase_demand_target = (
+        target_phase_delta.abs() / torch.pi * phase_confidence
+    ).detach().clamp(0.0, 1.0)
+    ri_demand_target = (
+        torch.linalg.vector_norm(remaining_residual, dim=1, keepdim=True)
+        / (clean_magnitude + polar_magnitude + eps)
+    ).detach().clamp(0.0, 1.0)
+
+    def binary_demand_loss(prediction, target):
+        return F.binary_cross_entropy(
+            prediction.clamp(eps, 1.0 - eps), target
+        )
+
+    loss_demand = (
+        binary_demand_loss(aux['mag_demand_gate'], magnitude_demand_target)
+        + binary_demand_loss(aux['phase_demand_gate'], phase_demand_target)
+        + binary_demand_loss(aux['ri_demand_gate'], ri_demand_target)
+    ) / 3.0
+    return {
+        'base_complex': loss_base_complex,
+        'magnitude': loss_magnitude,
+        'phase': loss_phase,
+        'polar_complex': loss_polar_complex,
+        'ri_residual': loss_ri_residual,
+        'demand': loss_demand,
+    }
+
+
+def _is_no_weight_decay_parameter(name, parameter):
+    """Keep SSM dynamics, normalization, and residual routing out of decay."""
+    if parameter.ndim <= 1 or getattr(parameter, '_no_weight_decay', False):
+        return True
+    lowered = name.lower()
+    return (
+        name.endswith('.bias')
+        or '.norm' in lowered
+        or 'normalization' in lowered
+        or 'gate' in lowered
+        or 'scale' in lowered
+        or 'a_log' in lowered
+        or 'a_logs' in lowered
+    )
+
+
+def _is_refiner_head_parameter(name):
+    lowered = name.lower()
+    return any(token in lowered for token in (
+        'demand',
+        'delta_log_mag_head',
+        'additive_mag',
+        'phase_delta',
+        'rotation_head',
+        'ri_residual',
+        'complex_residual',
+    ))
+
+
+def _generator_parameter_groups(generator, cfg):
+    optimizer_cfg = cfg['training_cfg'].get('optimizer', {})
+    base_lr = float(cfg['training_cfg']['learning_rate'])
+    weight_decay = float(optimizer_cfg.get('weight_decay', 0.01))
+    parent_lr_scale = float(optimizer_cfg.get('parent_lr_scale', 1.0))
+    refiner_lr_scale = float(optimizer_cfg.get('refiner_lr_scale', 1.0))
+    head_lr_scale = float(optimizer_cfg.get('refiner_head_lr_scale', 1.0))
+    if min(parent_lr_scale, refiner_lr_scale, head_lr_scale) <= 0.0:
+        raise ValueError('All generator optimizer learning-rate scales must be positive.')
+    if weight_decay < 0.0:
+        raise ValueError('training_cfg.optimizer.weight_decay must be non-negative.')
+
+    grouped = {}
+    seen = set()
+    for name, parameter in generator.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        parameter_id = id(parameter)
+        if parameter_id in seen:
+            raise RuntimeError(f'Duplicate generator parameter in optimizer: {name}')
+        seen.add(parameter_id)
+
+        is_refiner = 'asymmetric_polar_zip_refiner.' in name
+        if is_refiner and _is_refiner_head_parameter(name):
+            role = 'refiner_head'
+            lr_scale = head_lr_scale
+        elif is_refiner:
+            role = 'refiner_body'
+            lr_scale = refiner_lr_scale
+        else:
+            role = 'parent'
+            lr_scale = parent_lr_scale
+        decay = not _is_no_weight_decay_parameter(name, parameter)
+        key = (role, decay)
+        grouped.setdefault(key, []).append(parameter)
+
+    expected = {id(parameter) for parameter in generator.parameters() if parameter.requires_grad}
+    if seen != expected:
+        raise RuntimeError('Generator optimizer parameter partition is incomplete.')
+
+    groups = []
+    for (role, decay), parameters in grouped.items():
+        lr_scale = {
+            'parent': parent_lr_scale,
+            'refiner_body': refiner_lr_scale,
+            'refiner_head': head_lr_scale,
+        }[role]
+        groups.append({
+            'params': parameters,
+            'lr': base_lr * lr_scale,
+            'initial_lr': base_lr * lr_scale,
+            'lr_scale': lr_scale,
+            'weight_decay': weight_decay if decay else 0.0,
+            'group_name': f"{role}_{'decay' if decay else 'no_decay'}",
+        })
+    return groups
+
+
 def setup_optimizers(models, cfg):
     """Set up optimizers for the models."""
     generator, discriminator = models
     learning_rate = cfg['training_cfg']['learning_rate']
     betas = (cfg['training_cfg']['adam_b1'], cfg['training_cfg']['adam_b2'])
 
-    optim_g = optim.AdamW(generator.parameters(), lr=learning_rate, betas=betas)
-    optim_d = optim.AdamW(discriminator.parameters(), lr=learning_rate, betas=betas)
+    generator_groups = _generator_parameter_groups(generator, cfg)
+    discriminator_weight_decay = float(
+        cfg['training_cfg'].get('optimizer', {}).get(
+            'discriminator_weight_decay', 0.01
+        )
+    )
+    optim_g = optim.AdamW(generator_groups, lr=learning_rate, betas=betas)
+    optim_d = optim.AdamW(
+        discriminator.parameters(),
+        lr=learning_rate,
+        betas=betas,
+        weight_decay=discriminator_weight_decay,
+    )
 
     return optim_g, optim_d
 
@@ -112,6 +319,99 @@ def setup_schedulers(optimizers, cfg, last_epoch):
         scheduler_d.last_epoch = last_epoch
 
     return scheduler_g, scheduler_d
+
+
+def update_refiner_anchor_alpha(generator, steps, cfg):
+    """Blend identity and joint-refiner VJPs without changing forward values."""
+    if getattr(generator, 'asymmetric_polar_zip_refiner', None) is None:
+        return 1.0
+    model_cfg = cfg['model_cfg']
+    start = float(
+        model_cfg.get('asymmetric_polar_zip_refine_anchor_alpha_start', 0.0)
+    )
+    end = float(
+        model_cfg.get('asymmetric_polar_zip_refine_anchor_alpha_end', 1.0)
+    )
+    schedule_steps = int(
+        model_cfg.get('asymmetric_polar_zip_refine_anchor_schedule_steps', 20000)
+    )
+    if not 0.0 <= start <= 1.0 or not 0.0 <= end <= 1.0:
+        raise ValueError('Refiner anchor alpha endpoints must be in [0, 1].')
+    if schedule_steps < 0:
+        raise ValueError('Refiner anchor schedule steps must be non-negative.')
+    progress = 1.0 if schedule_steps == 0 else min(1.0, steps / schedule_steps)
+    alpha = start + (end - start) * progress
+    generator.set_asymmetric_refiner_anchor_alpha(alpha)
+    return alpha
+
+
+def clip_generator_gradients(generator, cfg):
+    """Clip the established parent and new refiner independently."""
+    training_cfg = cfg['training_cfg']
+    default_max_norm = float(training_cfg.get('max_grad_norm', 5.0))
+    parent_max_norm = float(training_cfg.get('parent_max_grad_norm', default_max_norm))
+    refiner_max_norm = float(training_cfg.get('refiner_max_grad_norm', default_max_norm))
+    parent_parameters = []
+    refiner_parameters = []
+    for name, parameter in generator.named_parameters():
+        if parameter.grad is None:
+            continue
+        if 'asymmetric_polar_zip_refiner.' in name:
+            refiner_parameters.append(parameter)
+        else:
+            parent_parameters.append(parameter)
+
+    norms = {'parent': 0.0, 'refiner': 0.0}
+    for key, parameters, max_norm in (
+        ('parent', parent_parameters, parent_max_norm),
+        ('refiner', refiner_parameters, refiner_max_norm),
+    ):
+        if not parameters:
+            continue
+        if max_norm > 0.0:
+            norm = torch.nn.utils.clip_grad_norm_(
+                parameters, max_norm, error_if_nonfinite=True
+            )
+        else:
+            norm = torch.linalg.vector_norm(torch.stack([
+                parameter.grad.detach().float().norm(2)
+                for parameter in parameters
+            ]), 2)
+        norms[key] = float(norm.detach().item())
+    return norms
+
+
+def load_parent_initialization(generator, checkpoint_path, device, cfg):
+    """Warm-start only the established parent while leaving the refiner new."""
+    checkpoint = load_checkpoint(checkpoint_path, device)
+    state_dict = checkpoint.get('generator', checkpoint)
+    refiner_prefix = 'asymmetric_polar_zip_refiner.'
+    refiner_buffer = 'asymmetric_polar_zip_refine_anchor_alpha'
+    parent_state_dict = {
+        key: value for key, value in state_dict.items()
+        if not key.startswith(refiner_prefix) and key != refiner_buffer
+    }
+    incompatible = generator.load_state_dict(parent_state_dict, strict=False)
+    unexpected = list(incompatible.unexpected_keys)
+    disallowed_missing = [
+        key for key in incompatible.missing_keys
+        if not key.startswith(refiner_prefix) and key != refiner_buffer
+    ]
+    if unexpected or disallowed_missing:
+        raise RuntimeError(
+            'Parent initialization is not architecture-compatible: '
+            f'missing={disallowed_missing}, unexpected={unexpected}'
+        )
+    optimizer_cfg = cfg['training_cfg'].setdefault('optimizer', {})
+    optimizer_cfg['parent_lr_scale'] = float(
+        optimizer_cfg.get('warm_start_parent_lr_scale', 0.2)
+    )
+    print(
+        f'Initialized parent from {checkpoint_path}; '
+        f'new refiner tensors={len(incompatible.missing_keys)}, '
+        f'parent_lr_scale={optimizer_cfg["parent_lr_scale"]:g}',
+        flush=True,
+    )
 
 
 def create_val_dataset(cfg, train=True, split=True, device='cuda:0'):
@@ -201,9 +501,17 @@ def train(rank, args, cfg):
         log_model_info(rank, generator, args.exp_path)
 
     state_dict_g, state_dict_do, steps, last_epoch = load_ckpts(args, device)
+    if args.init_parent_checkpoint is not None and state_dict_g is not None:
+        raise ValueError(
+            '--init_parent_checkpoint cannot be combined with checkpoint resume.'
+        )
     if state_dict_g is not None:
         generator.load_state_dict(state_dict_g['generator'], strict=False)
         discriminator.load_state_dict(state_dict_do['discriminator'], strict=False)
+    elif args.init_parent_checkpoint is not None:
+        load_parent_initialization(
+            generator, args.init_parent_checkpoint, device, cfg
+        )
 
     if num_gpus > 1 and torch.cuda.is_available():
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
@@ -283,6 +591,9 @@ def train(rank, args, cfg):
             noisy_pha = torch.autograd.Variable(noisy_pha.to(device, non_blocking=True))
             one_labels = torch.ones(batch_size).to(device, non_blocking=True)
 
+            anchor_alpha = update_refiner_anchor_alpha(
+                generator_core, steps, cfg
+            )
             mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
 
             audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
@@ -336,6 +647,9 @@ def train(rank, args, cfg):
             auxiliary_losses = harmonic_generation_losses(
                 generator_core, clean_mag, clean_com
             )
+            refiner_losses = asymmetric_refiner_losses(
+                generator_core, clean_mag, clean_com
+            )
             loss_cfg = cfg['training_cfg']['loss']
 
             loss_gen_all = (
@@ -348,16 +662,17 @@ def train(rank, args, cfg):
                 auxiliary_losses['coarse_complex'] * loss_cfg['coarse_complex'] +
                 auxiliary_losses['pitch'] * loss_cfg['pitch'] +
                 auxiliary_losses['voicing'] * loss_cfg['voicing'] +
-                auxiliary_losses['harmonic_support'] * loss_cfg['harmonic_support']
+                auxiliary_losses['harmonic_support'] * loss_cfg['harmonic_support'] +
+                refiner_losses['base_complex'] * loss_cfg.get('refiner_base_complex', 0.0) +
+                refiner_losses['magnitude'] * loss_cfg.get('refiner_magnitude', 0.0) +
+                refiner_losses['phase'] * loss_cfg.get('refiner_phase', 0.0) +
+                refiner_losses['polar_complex'] * loss_cfg.get('refiner_polar_complex', 0.0) +
+                refiner_losses['ri_residual'] * loss_cfg.get('refiner_ri_residual', 0.0) +
+                refiner_losses['demand'] * loss_cfg.get('refiner_demand', 0.0)
             )
 
             loss_gen_all.backward()
-            if max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    generator.parameters(),
-                    max_grad_norm,
-                    error_if_nonfinite=True
-                )
+            gradient_norms = clip_generator_gradients(generator_core, cfg)
             optim_g.step()
             # ------------------------------------------------------- #
 
@@ -416,6 +731,20 @@ def train(rank, args, cfg):
                             ),
                             flush=True
                         )
+                        if getattr(generator_core, 'asymmetric_polar_zip_refiner', None) is not None:
+                            print(
+                                'Asymmetric refiner optimization - Anchor alpha: {:4.3f}, '
+                                'Parent grad: {:4.3f}, Refiner grad: {:4.3f}, '
+                                'Base/Polar/RI: {:4.3f}/{:4.3f}/{:4.3f}'.format(
+                                    anchor_alpha,
+                                    gradient_norms['parent'],
+                                    gradient_norms['refiner'],
+                                    refiner_losses['base_complex'].item(),
+                                    refiner_losses['polar_complex'].item(),
+                                    refiner_losses['ri_residual'].item(),
+                                ),
+                                flush=True,
+                            )
 
                 # Checkpointing
                 if steps % cfg['env_setting']['checkpoint_interval'] == 0 and steps != 0:
@@ -499,12 +828,18 @@ def train(rank, args, cfg):
                         steps
                     )
                     if 'asymmetric_mag_stage_scales' in aux_snapshot:
+                        for loss_name, value in refiner_losses.items():
+                            sw.add_scalar(
+                                f"Training/Asymmetric Direct {loss_name.replace('_', ' ').title()} Loss",
+                                value.item(),
+                                steps,
+                            )
                         interaction_scales = torch.cat((
                             aux_snapshot['asymmetric_interaction_mag_scales'],
                             aux_snapshot['asymmetric_interaction_phase_scales'],
                         ))
                         applied_delta_abs = aux_snapshot[
-                            'applied_delta_log_mag'
+                            'applied_mag_multiplicative'
                         ].detach().abs().float().reshape(-1)
                         sw.add_scalar(
                             "Training/Asymmetric Mag Stage Scale",
@@ -527,13 +862,23 @@ def train(rank, args, cfg):
                             steps
                         )
                         sw.add_scalar(
-                            "Training/Asymmetric Outer Mag Gate",
-                            aux_snapshot['outer_mag_gate'].item(),
+                            "Training/Asymmetric Context Scale",
+                            aux_snapshot['asymmetric_context_scales'].abs().mean().item(),
                             steps
                         )
                         sw.add_scalar(
-                            "Training/Asymmetric Outer Phase Gate",
-                            aux_snapshot['outer_phase_gate'].item(),
+                            "Training/Asymmetric Magnitude Demand",
+                            aux_snapshot['mag_demand_gate'].mean().item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric Phase Demand",
+                            aux_snapshot['phase_demand_gate'].mean().item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric RI Demand",
+                            aux_snapshot['ri_demand_gate'].mean().item(),
                             steps
                         )
                         sw.add_scalar(
@@ -548,8 +893,36 @@ def train(rank, args, cfg):
                                 steps
                             )
                         sw.add_scalar(
+                            "Training/Asymmetric Additive Magnitude Activity",
+                            aux_snapshot['applied_mag_additive'].abs().mean().item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric Phase Delta Activity",
+                            aux_snapshot['applied_phase_delta'].abs().mean().item(),
+                            steps
+                        )
+                        sw.add_scalar(
                             "Training/Asymmetric RI Residual Activity",
                             aux_snapshot['ri_residual_applied'].abs().mean().item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric RI Residual Ratio",
+                            aux_snapshot['ri_residual_ratio'].item(),
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Asymmetric Anchor Alpha", anchor_alpha, steps
+                        )
+                        sw.add_scalar(
+                            "Training/Parent Gradient Norm",
+                            gradient_norms['parent'],
+                            steps
+                        )
+                        sw.add_scalar(
+                            "Training/Refiner Gradient Norm",
+                            gradient_norms['refiner'],
                             steps
                         )
 
@@ -681,15 +1054,29 @@ def train(rank, args, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
-    # parser.add_argument('--exp_name', default='Mambavision_emb_08')
-    parser.add_argument('--exp_name', default='residual_dense_full_v2')
-    parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
+    parser.add_argument(
+        '--exp_name', default='rd_asymmetric_polar_demand_v2_full_seed1234'
+    )
+    parser.add_argument(
+        '--config',
+        default=(
+            'recipes/RD-Asymmetric-Polar-Demand-V2/'
+            'RD-Asymmetric-Polar-Demand-V2.yaml'
+        ),
+    )
     parser.add_argument('--resume_from', default=None,
                         help='Optional checkpoint directory to load from while saving into exp_folder/exp_name.')
     parser.add_argument('--resume_step', type=int, default=None,
                         help='Optional checkpoint step to load from resume_from. Defaults to the latest step.')
     parser.add_argument('--resume_lr', type=float, default=None,
                         help='Optional effective optimizer learning rate after loading a checkpoint.')
+    parser.add_argument(
+        '--init_parent_checkpoint', default=None,
+        help=(
+            'Optional Residual-Dense generator checkpoint used only to initialize '
+            'the parent; training steps and optimizer state start fresh.'
+        ),
+    )
     parser.add_argument('--mini', action='store_true',
                         help='Use the repository mini train/validation JSON lists.')
     parser.add_argument('--epochs', type=int, default=None,

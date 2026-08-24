@@ -13,13 +13,44 @@ from .asymmetric_polar_zip_refine import AsymmetricPolarZipRefine
 import torch.nn.functional as F
 
 
-def apply_asymmetric_polar_zip_refiner_oneway_anchor(
-    refiner, noisy_complex, base_complex
+def apply_asymmetric_polar_zip_refiner_soft_vjp(
+    refiner, noisy_complex, base_complex, evidence=None, alpha=0.0
 ):
-    """Apply a value-equivalent refiner with an identity VJP to S0."""
+    """Keep forward values unchanged while mixing refiner and identity VJPs."""
+    if not isinstance(alpha, torch.Tensor):
+        alpha = float(alpha)
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise ValueError('Soft-VJP alpha must be finite and in [0, 1].')
+    alpha = torch.as_tensor(
+        alpha, dtype=base_complex.dtype, device=base_complex.device
+    )
+    if alpha.numel() != 1:
+        raise ValueError('Soft-VJP alpha must be one scalar.')
     anchor = base_complex.detach()
-    refined_anchor, aux = refiner(noisy_complex, anchor)
-    return refined_anchor + (base_complex - anchor), aux
+    soft_base = anchor + alpha * (base_complex - anchor)
+    soft_evidence = evidence
+    if evidence is not None:
+        soft_evidence = {}
+        for name, value in evidence.items():
+            evidence_anchor = value.detach()
+            soft_evidence[name] = (
+                evidence_anchor + alpha * (value - evidence_anchor)
+            )
+        refined_anchor, aux = refiner(
+            noisy_complex, soft_base, soft_evidence
+        )
+    else:
+        refined_anchor, aux = refiner(noisy_complex, soft_base)
+    return refined_anchor + (1.0 - alpha) * (base_complex - anchor), aux
+
+
+def apply_asymmetric_polar_zip_refiner_oneway_anchor(
+    refiner, noisy_complex, base_complex, evidence=None
+):
+    """Backward-compatible alpha=0 form of the soft-VJP adapter."""
+    return apply_asymmetric_polar_zip_refiner_soft_vjp(
+        refiner, noisy_complex, base_complex, evidence=evidence, alpha=0.0
+    )
 
 
 #####################################
@@ -492,6 +523,27 @@ class MambaSEUNet(nn.Module):
                 'asymmetric_polar_zip_refine_oneway_anchor', False
             )
         )
+        anchor_alpha = cfg['model_cfg'].get(
+            'asymmetric_polar_zip_refine_anchor_alpha'
+        )
+        if anchor_alpha is None:
+            anchor_alpha = cfg['model_cfg'].get(
+                'asymmetric_polar_zip_refine_anchor_alpha_start'
+            )
+        if anchor_alpha is None:
+            anchor_alpha = (
+                0.0 if self.asymmetric_polar_zip_refine_oneway_anchor else 1.0
+            )
+        anchor_alpha = float(anchor_alpha)
+        if not math.isfinite(anchor_alpha) or not 0.0 <= anchor_alpha <= 1.0:
+            raise ValueError(
+                'asymmetric_polar_zip_refine_anchor_alpha must be in [0, 1].'
+            )
+        self.register_buffer(
+            'asymmetric_polar_zip_refine_anchor_alpha',
+            torch.tensor(anchor_alpha),
+            persistent=self.asymmetric_polar_zip_refine_enabled,
+        )
         if (
             self.asymmetric_polar_zip_refine_oneway_anchor
             and not self.asymmetric_polar_zip_refine_enabled
@@ -525,6 +577,15 @@ class MambaSEUNet(nn.Module):
             finally:
                 torch.random.set_rng_state(rng_state)
         self.latest_aux = {}
+
+    def set_asymmetric_polar_zip_refine_anchor_alpha(self, alpha):
+        alpha = float(alpha)
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise ValueError('Soft-VJP alpha must be finite and in [0, 1].')
+        self.asymmetric_polar_zip_refine_anchor_alpha.fill_(alpha)
+
+    def set_asymmetric_refiner_anchor_alpha(self, alpha):
+        self.set_asymmetric_polar_zip_refine_anchor_alpha(alpha)
 
     def _build_harmonic_templates(self):
         n_fft = int(self.cfg['stft_cfg']['n_fft'])
@@ -812,6 +873,7 @@ class MambaSEUNet(nn.Module):
         for tm_block, fm_block in zip(self.restore_TM_middle, self.restore_FM_middle):
             restore_x3 = tm_block(restore_x3)
             restore_x3 = fm_block(restore_x3)
+        restore_bottleneck = restore_x3
 
         restore_y2 = self.restore_up3_2(restore_x3)
         restore_y2 = self.restore_concat_level2(
@@ -897,20 +959,36 @@ class MambaSEUNet(nn.Module):
         elif self.asymmetric_polar_zip_refiner is not None:
             noisy_complex_4d = torch.cat((noisy_real_4d, noisy_imag_4d), dim=1)
             base_complex_4d = torch.cat((base_real_4d, base_imag_4d), dim=1)
-            if self.asymmetric_polar_zip_refine_oneway_anchor:
-                refined_complex_4d, zip_refine_aux = (
-                    apply_asymmetric_polar_zip_refiner_oneway_anchor(
-                        self.asymmetric_polar_zip_refiner,
-                        noisy_complex_4d,
-                        base_complex_4d,
-                    )
+            coarse_complex_4d = torch.cat(
+                (coarse_real_4d, coarse_imag_4d), dim=1
+            )
+            refiner_evidence = {
+                'coarse_complex': coarse_complex_4d,
+                'base_minus_coarse': base_complex_4d - coarse_complex_4d,
+                'harmonic_prior': harmonic_prior,
+                'voicing_map': voicing_map,
+                'restoration_gates': restoration_gates,
+                'mag_final': mag_final,
+                'restore_final': restore_final,
+                'suppress_bottleneck': suppress_bottleneck,
+                'restore_bottleneck': restore_bottleneck,
+            }
+            refined_complex_4d, zip_refine_aux = (
+                apply_asymmetric_polar_zip_refiner_soft_vjp(
+                    self.asymmetric_polar_zip_refiner,
+                    noisy_complex_4d,
+                    base_complex_4d,
+                    evidence=refiner_evidence,
+                    alpha=self.asymmetric_polar_zip_refine_anchor_alpha,
                 )
-            else:
-                refined_complex_4d, zip_refine_aux = (
-                    self.asymmetric_polar_zip_refiner(
-                        noisy_complex_4d, base_complex_4d
-                    )
-                )
+            )
+            zip_refine_aux['asymmetric_polar_zip_refine_anchor_alpha'] = (
+                self.asymmetric_polar_zip_refine_anchor_alpha
+            )
+            zip_refine_aux['parent_base_complex'] = base_complex_4d
+            zip_refine_aux['refiner_coarse_complex'] = zip_refine_aux.pop(
+                'coarse_complex'
+            )
             enh_real_4d, enh_imag_4d = torch.chunk(
                 refined_complex_4d, 2, dim=1
             )

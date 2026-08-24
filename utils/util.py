@@ -117,10 +117,12 @@ def load_optimizer_states(optimizers, state_dict_do, cfg=None, resume_lr=None):
             base_lr = cfg['training_cfg']['learning_rate']
             for optimizer in (optim_g, optim_d):
                 for group in optimizer.param_groups:
+                    lr_scale = float(group.get('lr_scale', 1.0))
+                    target_base_lr = base_lr * lr_scale
                     old_base_lr = group.get('initial_lr', group['lr'])
-                    group['initial_lr'] = base_lr
+                    group['initial_lr'] = target_base_lr
                     if resume_lr is not None:
-                        group['lr'] = resume_lr
+                        group['lr'] = resume_lr * lr_scale
                     else:
                         decay_ratio = group['lr'] / old_base_lr if old_base_lr > 0 else 1.0
-                        group['lr'] = base_lr * decay_ratio
+                        group['lr'] = target_base_lr * decay_ratio

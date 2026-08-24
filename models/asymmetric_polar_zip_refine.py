@@ -1,10 +1,4 @@
-"""Asymmetric magnitude/phase polar refinement for Residual-Dense MPDM-Net.
-
-The parent generator and its S0 construction stay untouched. This optional
-post-refiner consumes X and S0 as eight real-valued maps, runs asymmetric
-frequency/time towers, then applies an exactly identity-initialized polar
-correction followed by the zero-head A/B complex residual path.
-"""
+"""Evidence-conditioned asymmetric polar refinement for Residual-Dense MPDM-Net."""
 
 import math
 from copy import deepcopy
@@ -114,59 +108,112 @@ class _AlignedSS2DCross(SS2D_cross_new):
         return y1, y2
 
 
-class _AxisPath(nn.Module):
-    """One branch of a paired stage, excluding cross-branch interaction."""
+class _ChannelLayerNorm(nn.Module):
+    """LayerNorm over channels while preserving a channels-first TF layout."""
 
-    def __init__(self, cfg, channels, ratio, frequency_first):
+    def __init__(self, channels):
         super().__init__()
-        if ratio not in (1, 2):
-            raise ValueError(f'Unsupported compression ratio: {ratio}')
-        self.ratio = ratio
+        self.channels = int(channels)
+        self.norm = nn.LayerNorm(self.channels)
+
+    def forward(self, features):
+        if features.ndim != 4 or features.shape[1] != self.channels:
+            raise ValueError(
+                f'Expected [B, {self.channels}, H, W], got {tuple(features.shape)}.'
+            )
+        return self.norm(
+            features.permute(0, 2, 3, 1)
+        ).permute(0, 3, 1, 2).contiguous()
+
+
+def _init_small(module, std=1e-3, bias=0.0):
+    nn.init.normal_(module.weight, mean=0.0, std=std)
+    if module.bias is not None:
+        nn.init.constant_(module.bias, bias)
+
+
+class _AxisPath(nn.Module):
+    """Axis-specialized residual model used after the stage transition."""
+
+    def __init__(self, cfg, channels, frequency_first):
+        super().__init__()
         first = FMambaBlock if frequency_first else TMambaBlock
         second = TMambaBlock if frequency_first else FMambaBlock
-        self.pre_norm = nn.GroupNorm(1, channels)
+        self.pre_norm = _ChannelLayerNorm(channels)
         self.axis_blocks = nn.ModuleList((first(cfg, channels), second(cfg, channels)))
-        self.same_resolution = None
-        self.down = None
-        self.up = None
-        if ratio == 2:
-            self.same_resolution = nn.Sequential(
-                nn.Conv2d(
-                    channels, channels, 3, padding=1, groups=channels, bias=False
-                ),
-                nn.Conv2d(channels, channels, 1, bias=False),
-                nn.GELU(),
-            )
-            self.down = nn.Sequential(
-                nn.Conv2d(channels, channels, 3, stride=2, padding=1, bias=False),
-                nn.GroupNorm(1, channels),
-                nn.GELU(),
-            )
-            self.up = nn.ConvTranspose2d(
-                channels, channels, 3, stride=2, padding=1, bias=False
-            )
         self.residual_scale = _scale_parameter(0.10)
 
-    def encode(self, features):
+    def forward(self, features):
         residual = self.pre_norm(features)
-        same_resolution = None
-        if self.ratio == 2:
-            same_resolution = self.same_resolution(residual)
-            residual = self.down(residual)
         for block in self.axis_blocks:
             residual = block(residual)
-        return residual, same_resolution
+        return features + torch.tanh(self.residual_scale) * residual
 
-    def restore(self, source, residual, same_resolution):
-        if self.ratio == 2:
-            residual = self.up(residual, output_size=source.shape)
-            if residual.shape != source.shape:
-                raise RuntimeError(
-                    f'Zip restoration shape mismatch: {tuple(residual.shape)} != '
-                    f'{tuple(source.shape)}'
-                )
-            residual = residual + same_resolution
-        return source + torch.tanh(self.residual_scale) * residual
+
+class _DownTransition(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(
+                channels, channels, 3, stride=2, padding=1,
+                groups=channels, bias=False,
+            ),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            _ChannelLayerNorm(channels),
+            nn.GELU(),
+        )
+
+    def forward(self, features):
+        return self.body(features)
+
+
+class _UpSkipTransition(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(
+            channels, channels, 3, stride=2, padding=1, bias=False
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 1, bias=False),
+            _ChannelLayerNorm(channels),
+            nn.GELU(),
+        )
+
+    def forward(self, features, skip):
+        features = self.up(features, output_size=skip.shape)
+        if features.shape != skip.shape:
+            raise RuntimeError(
+                f'Full-resolution skip mismatch: {tuple(features.shape)} != '
+                f'{tuple(skip.shape)}.'
+            )
+        return self.fuse(torch.cat((features, skip), dim=1))
+
+
+class _LatentInjection(nn.Module):
+    """Project a generator latent and inject it through a small learnable gate."""
+
+    def __init__(self, in_channels, out_channels, initial_scale=0.05):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.projection = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.norm = _ChannelLayerNorm(out_channels)
+        self.scale = _scale_parameter(initial_scale)
+
+    def forward(self, target, latent):
+        if latent.ndim != 4 or latent.shape[1] != self.in_channels:
+            raise ValueError(
+                f'Latent must have shape [B, {self.in_channels}, H, W], got '
+                f'{tuple(latent.shape)}.'
+            )
+        if latent.shape[0] != target.shape[0]:
+            raise ValueError('Latent and target batch dimensions differ.')
+        update = self.projection(latent)
+        if update.shape[2:] != target.shape[2:]:
+            update = F.interpolate(
+                update, size=target.shape[2:], mode='bilinear', align_corners=False
+            )
+        update = self.norm(update)
+        return target + torch.tanh(self.scale) * update
 
 
 class _ProjectedCrossInteraction(nn.Module):
@@ -204,14 +251,12 @@ class _ProjectedCrossInteraction(nn.Module):
         )
         self.mag_cross_gate = nn.Conv2d(common_channels * 2, common_channels, 1)
         self.phase_cross_gate = nn.Conv2d(common_channels * 2, common_channels, 1)
-        nn.init.zeros_(self.mag_cross_gate.weight)
-        nn.init.zeros_(self.phase_cross_gate.weight)
-        nn.init.constant_(self.mag_cross_gate.bias, gate_bias)
-        nn.init.constant_(self.phase_cross_gate.bias, gate_bias)
+        _init_small(self.mag_cross_gate, bias=gate_bias)
+        _init_small(self.phase_cross_gate, bias=gate_bias)
         self.mag_eca = eca_layer(common_channels)
         self.phase_eca = eca_layer(common_channels)
-        self.mag_calibration = nn.GroupNorm(1, common_channels)
-        self.phase_calibration = nn.GroupNorm(1, common_channels)
+        self.mag_calibration = _ChannelLayerNorm(common_channels)
+        self.phase_calibration = _ChannelLayerNorm(common_channels)
         self.mag_back_projection = nn.Conv2d(
             common_channels, mag_channels, 1, bias=False
         )
@@ -252,15 +297,14 @@ class _ProjectedCrossInteraction(nn.Module):
 
 
 class _CompressedMagnitudeDenseBridge(nn.Module):
-    """Fuse Stage-2 context into Stage-3 in the 80-channel zip domain."""
+    """Fuse Stage-2 context before Stage-3 compressed-domain modeling."""
 
-    channels = 80
-    hidden_channels = 20
-
-    def __init__(self):
+    def __init__(self, channels):
         super().__init__()
+        self.channels = int(channels)
+        self.hidden_channels = max(8, self.channels // 4)
         self.fusion = nn.Sequential(
-            nn.GroupNorm(1, self.channels * 2),
+            _ChannelLayerNorm(self.channels * 2),
             nn.Conv2d(self.channels * 2, self.hidden_channels, 1, bias=False),
             nn.PReLU(self.hidden_channels),
             nn.Conv2d(
@@ -271,11 +315,11 @@ class _CompressedMagnitudeDenseBridge(nn.Module):
                 groups=self.hidden_channels,
                 bias=False,
             ),
-            nn.GroupNorm(1, self.hidden_channels),
+            _ChannelLayerNorm(self.hidden_channels),
             nn.PReLU(self.hidden_channels),
             nn.Conv2d(self.hidden_channels, self.channels, 1, bias=False),
         )
-        self.residual_scale = nn.Parameter(torch.zeros(()))
+        self.residual_scale = _scale_parameter(0.05)
 
     def forward(self, target, context):
         expected_channels = self.channels
@@ -300,17 +344,23 @@ class _CompressedMagnitudeDenseBridge(nn.Module):
 
 
 class _PairedStage(nn.Module):
-    """Run both asymmetric paths and interact at the specified stage position."""
+    """One persistent-resolution stage in the asymmetric backend."""
 
     def __init__(
-        self, cfg, mag_channels, phase_channels, ratio, common_channels=None,
+        self, cfg, mag_channels, phase_channels, mode, common_channels=None,
         compressed_dense_bridge_enabled=False,
     ):
         super().__init__()
-        self.ratio = ratio
+        if mode not in ('full', 'down', 'half', 'up'):
+            raise ValueError(f'Unsupported stage mode: {mode}.')
+        self.mode = mode
         self.common_channels = common_channels
-        self.mag_path = _AxisPath(cfg, mag_channels, ratio, frequency_first=True)
-        self.phase_path = _AxisPath(cfg, phase_channels, ratio, frequency_first=False)
+        self.mag_path = _AxisPath(cfg, mag_channels, frequency_first=True)
+        self.phase_path = _AxisPath(cfg, phase_channels, frequency_first=False)
+        self.mag_down = _DownTransition(mag_channels) if mode == 'down' else None
+        self.phase_down = _DownTransition(phase_channels) if mode == 'down' else None
+        self.mag_up = _UpSkipTransition(mag_channels) if mode == 'up' else None
+        self.phase_up = _UpSkipTransition(phase_channels) if mode == 'up' else None
         self.interaction = None
         if common_channels is not None:
             self.interaction = _ProjectedCrossInteraction(
@@ -326,63 +376,56 @@ class _PairedStage(nn.Module):
             )
         self.interaction_position = (
             'none' if self.interaction is None
-            else 'compressed_pre_up' if ratio == 2
+            else 'compressed' if mode in ('down', 'half')
             else 'full_resolution'
         )
         self.compressed_mag_dense_bridge = None
         if compressed_dense_bridge_enabled:
-            if ratio != 2 or mag_channels != 80:
+            if mode != 'half':
                 raise ValueError(
-                    'The approved dense bridge requires a ratio-2, 80-channel '
-                    'magnitude stage.'
+                    'The dense bridge requires the half-resolution Stage-3 path.'
                 )
             rng_state = torch.random.get_rng_state()
             try:
                 self.compressed_mag_dense_bridge = (
-                    _CompressedMagnitudeDenseBridge()
+                    _CompressedMagnitudeDenseBridge(mag_channels)
                 )
             finally:
                 torch.random.set_rng_state(rng_state)
 
-    def _forward_impl(self, mag_features, phase_features, mag_dense_context=None):
-        mag_residual, mag_same = self.mag_path.encode(mag_features)
-        phase_residual, phase_same = self.phase_path.encode(phase_features)
-        if self.interaction is not None:
-            mag_residual, phase_residual = self.interaction(
-                mag_residual, phase_residual
-            )
+    def forward(
+        self, mag_features, phase_features, mag_dense_context=None,
+        mag_skip=None, phase_skip=None,
+    ):
+        if self.mode == 'down':
+            mag_features = self.mag_down(mag_features)
+            phase_features = self.phase_down(phase_features)
+        elif self.mode == 'up':
+            if mag_skip is None or phase_skip is None:
+                raise ValueError('Stage-4 upsampling requires both Stage-1 skips.')
+            mag_features = self.mag_up(mag_features, mag_skip)
+            phase_features = self.phase_up(phase_features, phase_skip)
         if self.compressed_mag_dense_bridge is not None:
             if mag_dense_context is None:
                 raise ValueError('Stage-3 dense bridge requires Stage-2 context.')
-            mag_residual = self.compressed_mag_dense_bridge(
-                mag_residual, mag_dense_context
+            mag_features = self.compressed_mag_dense_bridge(
+                mag_features, mag_dense_context
             )
-        mag_output = self.mag_path.restore(
-            mag_features, mag_residual, mag_same
-        )
-        phase_output = self.phase_path.restore(
-            phase_features, phase_residual, phase_same
-        )
-        return mag_output, phase_output, mag_residual
-
-    def forward(self, mag_features, phase_features):
-        mag_output, phase_output, _ = self._forward_impl(
-            mag_features, phase_features
-        )
-        return mag_output, phase_output
-
-    def forward_with_compressed_state(
-        self, mag_features, phase_features, mag_dense_context=None
-    ):
-        return self._forward_impl(
-            mag_features, phase_features, mag_dense_context
-        )
+        mag_features = self.mag_path(mag_features)
+        phase_features = self.phase_path(phase_features)
+        if self.interaction is not None:
+            mag_features, phase_features = self.interaction(
+                mag_features, phase_features
+            )
+        return mag_features, phase_features
 
 
 class AsymmetricPolarZipRefine(nn.Module):
-    """Four paired stages with an 80-channel mag and 40-channel phase tower."""
+    """Evidence-conditioned four-stage 80/40-channel mag/phase backend."""
 
     compression_ratios = (1, 2, 2, 1)
+    stage_modes = ('full', 'down', 'half', 'up')
+    evidence_channels = 20
 
     def __init__(self, cfg):
         super().__init__()
@@ -409,13 +452,45 @@ class AsymmetricPolarZipRefine(nn.Module):
         self.delta_limit = float(
             model_cfg.get('asymmetric_polar_zip_refine_delta_limit', 1.0)
         )
-        self.complex_residual_scale = float(
-            model_cfg.get('asymmetric_polar_zip_refine_complex_residual_scale', 0.1)
-        )
-        self.complex_residual_gate_bias = float(
+        self.additive_limit = float(
             model_cfg.get(
-                'asymmetric_polar_zip_refine_complex_residual_gate_bias', -2.0
+                'asymmetric_polar_zip_refine_additive_mag_scale',
+                model_cfg.get('asymmetric_polar_zip_refine_additive_limit', 0.5),
             )
+        )
+        self.magnitude_floor = float(
+            model_cfg.get(
+                'asymmetric_polar_zip_refine_reference_floor',
+                model_cfg.get('asymmetric_polar_zip_refine_magnitude_floor', 1e-4),
+            )
+        )
+        self.phase_delta_limit = float(
+            model_cfg.get('asymmetric_polar_zip_refine_phase_delta_limit', 1.0)
+        )
+        self.complex_residual_scale = float(
+            model_cfg.get(
+                'asymmetric_polar_zip_refine_initial_complex_residual_scale',
+                model_cfg.get(
+                    'asymmetric_polar_zip_refine_complex_residual_scale', 0.1
+                ),
+            )
+        )
+        self.complex_residual_max_scale = float(
+            model_cfg.get(
+                'asymmetric_polar_zip_refine_max_complex_residual_scale',
+                model_cfg.get(
+                    'asymmetric_polar_zip_refine_complex_residual_max_scale', 0.5
+                ),
+            )
+        )
+        self.context_initial_scale = float(
+            model_cfg.get('asymmetric_polar_zip_refine_context_scale', 0.05)
+        )
+        self.persistent_backbone = bool(
+            model_cfg.get('asymmetric_polar_zip_refine_persistent_backbone', True)
+        )
+        self.demand_gate_bias = float(
+            model_cfg.get('asymmetric_polar_zip_refine_demand_gate_bias', -1.5)
         )
         self.activation_checkpointing = bool(
             model_cfg.get(
@@ -428,99 +503,236 @@ class AsymmetricPolarZipRefine(nn.Module):
                 False,
             )
         )
-        if self.mag_channels != 80 or self.phase_channels != 40:
-            raise ValueError('The approved asymmetric widths are magnitude=80, phase=40.')
-        if self.stage_common_channels != (0, 64, 64, 40):
-            raise ValueError('Approved common widths are [0, 64, 64, 40].')
-        if self.refiner_expand != 2:
-            raise ValueError('The approved refiner-specific expand is 2.')
+        if self.mag_channels <= 0 or self.phase_channels <= 0:
+            raise ValueError('Magnitude and phase refiner widths must be positive.')
+        if len(self.stage_common_channels) != len(self.stage_modes):
+            raise ValueError('One interaction width is required for each refiner stage.')
+        if any(int(width) < 0 for width in self.stage_common_channels):
+            raise ValueError('Refiner interaction widths must be non-negative.')
+        if self.refiner_expand <= 0:
+            raise ValueError('The refiner-specific Mamba expand must be positive.')
         if self.eps <= 0.0:
             raise ValueError('asymmetric_polar_zip_refine_eps must be positive.')
         if self.phase_eps <= 0.0:
             raise ValueError('phase_eps must be positive.')
         if not 0.0 < self.delta_limit <= 8.0:
             raise ValueError('delta_limit must be in (0, 8].')
-        if self.complex_residual_scale != 0.1:
-            raise ValueError('The approved A/B complex residual scale is 0.1.')
+        if self.additive_limit <= 0.0 or self.magnitude_floor <= 0.0:
+            raise ValueError('Magnitude additive limit and floor must be positive.')
+        if not 0.0 < self.phase_delta_limit <= math.pi:
+            raise ValueError('phase_delta_limit must be in (0, pi].')
+        if not 0.0 < self.complex_residual_scale < self.complex_residual_max_scale:
+            raise ValueError(
+                'The RI initial ratio must be positive and below its maximum.'
+            )
+        if not 0.0 < self.context_initial_scale < 1.0:
+            raise ValueError('Refiner context scale must be in (0, 1).')
+        if not self.persistent_backbone:
+            raise ValueError(
+                'The approved refiner requires persistent full-half-half-full stages.'
+            )
 
         refiner_cfg = deepcopy(cfg)
         refiner_cfg['model_cfg']['expand'] = self.refiner_expand
         self.core_cfg = refiner_cfg
 
+        mag_base = int(model_cfg['hid_feature'])
+        restore_base = max(
+            1, int(round(
+                mag_base * float(model_cfg.get('restoration_width_ratio', 1.0))
+            ))
+        )
+        self.evidence_specs = {
+            'mag_final': (mag_base, 'full'),
+            'restore_final': (restore_base, 'full'),
+            'suppress_bottleneck': (mag_base * 3, 'bottleneck'),
+            'restore_bottleneck': (restore_base * 3, 'bottleneck'),
+        }
+
         self.mag_stem = nn.Sequential(
-            nn.Conv2d(8, self.mag_channels, 3, padding=1),
-            nn.GroupNorm(1, self.mag_channels),
+            nn.Conv2d(self.evidence_channels, self.mag_channels, 3, padding=1),
+            _ChannelLayerNorm(self.mag_channels),
             nn.GELU(),
         )
         self.phase_stem = nn.Sequential(
-            nn.Conv2d(8, self.phase_channels, 3, padding=1),
-            nn.GroupNorm(1, self.phase_channels),
+            nn.Conv2d(self.evidence_channels, self.phase_channels, 3, padding=1),
+            _ChannelLayerNorm(self.phase_channels),
             nn.GELU(),
         )
+        self.full_context_injections = nn.ModuleDict({
+            'mag_from_mag': _LatentInjection(
+                mag_base, self.mag_channels, self.context_initial_scale
+            ),
+            'mag_from_restore': _LatentInjection(
+                restore_base, self.mag_channels, self.context_initial_scale
+            ),
+            'phase_from_mag': _LatentInjection(
+                mag_base, self.phase_channels, self.context_initial_scale
+            ),
+            'phase_from_restore': _LatentInjection(
+                restore_base, self.phase_channels, self.context_initial_scale
+            ),
+        })
+        self.bottleneck_context_injections = nn.ModuleDict({
+            'mag_from_suppress': _LatentInjection(
+                mag_base * 3, self.mag_channels, self.context_initial_scale
+            ),
+            'mag_from_restore': _LatentInjection(
+                restore_base * 3, self.mag_channels, self.context_initial_scale
+            ),
+            'phase_from_suppress': _LatentInjection(
+                mag_base * 3, self.phase_channels, self.context_initial_scale
+            ),
+            'phase_from_restore': _LatentInjection(
+                restore_base * 3, self.phase_channels, self.context_initial_scale
+            ),
+        })
         self.paired_stages = nn.ModuleList([
             _PairedStage(
                 refiner_cfg,
                 self.mag_channels,
                 self.phase_channels,
-                ratio,
+                mode,
                 common_channels or None,
                 compressed_dense_bridge_enabled=(
                     self.compressed_dense_bridge_enabled and stage_index == 2
                 ),
             )
-            for stage_index, (ratio, common_channels) in enumerate(zip(
-                self.compression_ratios, self.stage_common_channels
+            for stage_index, (mode, common_channels) in enumerate(zip(
+                self.stage_modes, self.stage_common_channels
             ))
         ])
         self.delta_log_mag_head = nn.Conv2d(self.mag_channels, 1, 1)
-        self.rotation_head = nn.Conv2d(self.phase_channels, 2, 1)
-        self.outer_mag_gate = nn.Parameter(torch.zeros(()))
-        self.outer_phase_gate = nn.Parameter(torch.zeros(()))
+        self.delta_add_mag_head = nn.Conv2d(self.mag_channels, 1, 1)
+        self.phase_delta_head = nn.Conv2d(self.phase_channels, 1, 1)
+        self.mag_demand_head = nn.Conv2d(self.mag_channels, 1, 1)
+        self.phase_demand_head = nn.Conv2d(self.phase_channels, 1, 1)
+        for head in (
+            self.delta_log_mag_head, self.delta_add_mag_head,
+            self.phase_delta_head,
+        ):
+            _init_small(head)
+        _init_small(self.mag_demand_head, bias=self.demand_gate_bias)
+        _init_small(self.phase_demand_head, bias=self.demand_gate_bias)
 
-        self.ri_residual_head = nn.Sequential(
-            nn.GroupNorm(1, self.phase_channels),
+        self.ri_feature_fusion = nn.Sequential(
             nn.Conv2d(
+                self.mag_channels + self.phase_channels,
                 self.phase_channels,
-                self.phase_channels,
+                1,
+                bias=False,
+            ),
+            _ChannelLayerNorm(self.phase_channels),
+            nn.GELU(),
+        )
+        ri_input_channels = self.phase_channels + 8
+        self.ri_residual_head = nn.Sequential(
+            _ChannelLayerNorm(ri_input_channels),
+            nn.Conv2d(
+                ri_input_channels,
+                ri_input_channels,
                 3,
                 padding=1,
-                groups=self.phase_channels,
+                groups=ri_input_channels,
                 bias=False,
             ),
             nn.GELU(),
-            nn.Conv2d(self.phase_channels, 2, 1),
+            nn.Conv2d(ri_input_channels, 2, 1),
         )
-        self.ri_residual_gate = nn.Conv2d(self.phase_channels, 1, 1)
-        nn.init.zeros_(self.ri_residual_head[-1].weight)
-        nn.init.zeros_(self.ri_residual_head[-1].bias)
-        nn.init.zeros_(self.ri_residual_gate.weight)
-        nn.init.constant_(
-            self.ri_residual_gate.bias, self.complex_residual_gate_bias
-        )
+        self.ri_demand_head = nn.Conv2d(ri_input_channels, 1, 1)
+        _init_small(self.ri_residual_head[-1])
+        _init_small(self.ri_demand_head, bias=self.demand_gate_bias)
+        residual_fraction = self.complex_residual_scale / self.complex_residual_max_scale
+        self.ri_residual_ratio_logit = nn.Parameter(torch.tensor(
+            math.log(residual_fraction / (1.0 - residual_fraction))
+        ))
+
+    @property
+    def outer_mag_gate(self):
+        return self.mag_demand_head.bias
+
+    @property
+    def outer_phase_gate(self):
+        return self.phase_demand_head.bias
+
+    @property
+    def ri_residual_gate(self):
+        return self.ri_demand_head
+
+    @property
+    def rotation_head(self):
+        return self.phase_delta_head
 
     @property
     def compressed_mag_dense_bridge(self):
         return self.paired_stages[2].compressed_mag_dense_bridge
 
-    def _run_stage(self, stage, mag_features, phase_features):
+    def _run_stage(self, stage, *arguments):
         if self.activation_checkpointing and self.training and torch.is_grad_enabled():
-            return checkpoint(
-                stage, mag_features, phase_features, use_reentrant=False
+            return checkpoint(stage, *arguments, use_reentrant=False)
+        return stage(*arguments)
+
+    @staticmethod
+    def _complex_magnitude(value):
+        return torch.linalg.vector_norm(value, dim=1, keepdim=True)
+
+    def _validate_evidence(self, noisy_complex, evidence):
+        if not isinstance(evidence, dict):
+            raise TypeError('evidence must be a dict of generator tensors.')
+        required = {
+            'coarse_complex', 'base_minus_coarse', 'harmonic_prior',
+            'voicing_map', 'restoration_gates', 'mag_final', 'restore_final',
+            'suppress_bottleneck', 'restore_bottleneck',
+        }
+        missing = sorted(required.difference(evidence))
+        extra = sorted(set(evidence).difference(required))
+        if missing or extra:
+            raise ValueError(
+                f'Evidence keys differ; missing={missing}, unexpected={extra}.'
             )
-        return stage(mag_features, phase_features)
+        batch, _, frames, bins = noisy_complex.shape
+        full_shapes = {
+            'coarse_complex': (batch, 2, frames, bins),
+            'base_minus_coarse': (batch, 2, frames, bins),
+            'harmonic_prior': (batch, 1, frames, bins),
+            'voicing_map': (batch, 1, frames, bins),
+            'restoration_gates': (batch, 2, frames, bins),
+        }
+        for name, expected_shape in full_shapes.items():
+            value = evidence[name]
+            if tuple(value.shape) != expected_shape:
+                raise ValueError(
+                    f'{name} must have shape {expected_shape}, got {tuple(value.shape)}.'
+                )
+        encoded_bins = (bins + 1) // 2
+        latent_shapes = {
+            'mag_final': (batch, self.evidence_specs['mag_final'][0], frames, encoded_bins),
+            'restore_final': (
+                batch, self.evidence_specs['restore_final'][0], frames, encoded_bins
+            ),
+            'suppress_bottleneck': (
+                batch, self.evidence_specs['suppress_bottleneck'][0],
+                frames // 4, encoded_bins // 4,
+            ),
+            'restore_bottleneck': (
+                batch, self.evidence_specs['restore_bottleneck'][0],
+                frames // 4, encoded_bins // 4,
+            ),
+        }
+        for name, expected_shape in latent_shapes.items():
+            value = evidence[name]
+            if tuple(value.shape) != expected_shape:
+                raise ValueError(
+                    f'{name} must have shape {expected_shape}, got {tuple(value.shape)}.'
+                )
+        for name in required:
+            value = evidence[name]
+            if value.device != noisy_complex.device:
+                raise ValueError(f'{name} must match noisy_complex device.')
+            if not torch.isfinite(value).all():
+                raise RuntimeError(f'{name} contains NaN/Inf.')
 
-    def _run_stage_with_compressed_state(
-        self, stage, mag_features, phase_features, mag_dense_context=None
-    ):
-        function = stage.forward_with_compressed_state
-        arguments = [mag_features, phase_features]
-        if mag_dense_context is not None:
-            arguments.append(mag_dense_context)
-        if self.activation_checkpointing and self.training and torch.is_grad_enabled():
-            return checkpoint(function, *arguments, use_reentrant=False)
-        return function(*arguments)
-
-    def build_eight_map_input(self, noisy_complex, base_complex):
+    def build_evidence_input(self, noisy_complex, base_complex, evidence):
         for name, value in (
             ('noisy_complex', noisy_complex), ('base_complex', base_complex)
         ):
@@ -531,127 +743,208 @@ class AsymmetricPolarZipRefine(nn.Module):
                 f'Complex input shapes differ: {tuple(noisy_complex.shape)} vs '
                 f'{tuple(base_complex.shape)}'
             )
-        noisy_mag = torch.linalg.vector_norm(noisy_complex, dim=1, keepdim=True)
-        base_mag = torch.linalg.vector_norm(base_complex, dim=1, keepdim=True)
+        self._validate_evidence(noisy_complex, evidence)
+        coarse_complex = evidence['coarse_complex']
+        noisy_mag = self._complex_magnitude(noisy_complex)
+        base_mag = self._complex_magnitude(base_complex)
+        coarse_mag = self._complex_magnitude(coarse_complex)
+        safe_noisy_unit = noisy_complex / noisy_mag.clamp_min(self.eps)
+        identity_unit = torch.zeros_like(noisy_complex)
+        identity_unit[:, :1] = 1.0
+        noisy_unit = torch.where(noisy_mag > self.phase_eps, safe_noisy_unit, identity_unit)
+        base_unit = torch.where(
+            base_mag > self.phase_eps,
+            base_complex / base_mag.clamp_min(self.eps),
+            noisy_unit,
+        )
+        noisy_real, noisy_imag = torch.chunk(noisy_unit, 2, dim=1)
+        base_real, base_imag = torch.chunk(base_unit, 2, dim=1)
+        relative_phase = torch.cat((
+            noisy_real * base_real + noisy_imag * base_imag,
+            noisy_imag * base_real - noisy_real * base_imag,
+        ), dim=1)
         maps = torch.cat((
             noisy_complex,
             base_complex,
             noisy_complex - base_complex,
+            coarse_complex,
+            evidence['base_minus_coarse'],
             torch.log1p(noisy_mag),
             torch.log1p(base_mag),
+            torch.log1p(coarse_mag),
+            torch.log(
+                (base_mag + self.eps) / (noisy_mag + self.eps)
+            ).clamp(-8.0, 8.0),
+            relative_phase,
+            evidence['harmonic_prior'],
+            evidence['voicing_map'],
+            evidence['restoration_gates'],
         ), dim=1)
-        if maps.shape[1] != 8:
-            raise RuntimeError(f'Expected eight refinement maps, got {maps.shape[1]}.')
+        if maps.shape[1] != self.evidence_channels:
+            raise RuntimeError(
+                f'Expected {self.evidence_channels} evidence maps, got {maps.shape[1]}.'
+            )
         return maps
 
-    def forward(self, noisy_complex, base_complex):
-        maps = self.build_eight_map_input(noisy_complex, base_complex)
+    def forward(self, noisy_complex, base_complex, evidence):
+        maps = self.build_evidence_input(noisy_complex, base_complex, evidence)
         if not torch.isfinite(maps).all():
             raise RuntimeError('Asymmetric polar refiner input contains NaN/Inf.')
 
         mag_features = self.mag_stem(maps)
         phase_features = self.phase_stem(maps)
-        if not self.compressed_dense_bridge_enabled:
-            for stage in self.paired_stages:
-                mag_features, phase_features = self._run_stage(
-                    stage, mag_features, phase_features
-                )
+        mag_features = self.full_context_injections['mag_from_mag'](
+            mag_features, evidence['mag_final']
+        )
+        mag_features = self.full_context_injections['mag_from_restore'](
+            mag_features, evidence['restore_final']
+        )
+        phase_features = self.full_context_injections['phase_from_mag'](
+            phase_features, evidence['mag_final']
+        )
+        phase_features = self.full_context_injections['phase_from_restore'](
+            phase_features, evidence['restore_final']
+        )
+
+        mag_features, phase_features = self._run_stage(
+            self.paired_stages[0], mag_features, phase_features
+        )
+        mag_stage1_skip, phase_stage1_skip = mag_features, phase_features
+        mag_features, phase_features = self._run_stage(
+            self.paired_stages[1], mag_features, phase_features
+        )
+        stage2_dense_context = mag_features
+        mag_features = self.bottleneck_context_injections['mag_from_suppress'](
+            mag_features, evidence['suppress_bottleneck']
+        )
+        mag_features = self.bottleneck_context_injections['mag_from_restore'](
+            mag_features, evidence['restore_bottleneck']
+        )
+        phase_features = self.bottleneck_context_injections['phase_from_suppress'](
+            phase_features, evidence['suppress_bottleneck']
+        )
+        phase_features = self.bottleneck_context_injections['phase_from_restore'](
+            phase_features, evidence['restore_bottleneck']
+        )
+        if self.compressed_dense_bridge_enabled:
+            mag_features, phase_features = self._run_stage(
+                self.paired_stages[2], mag_features, phase_features,
+                stage2_dense_context,
+            )
         else:
             mag_features, phase_features = self._run_stage(
-                self.paired_stages[0], mag_features, phase_features
+                self.paired_stages[2], mag_features, phase_features
             )
-            mag_features, phase_features, stage2_compressed = (
-                self._run_stage_with_compressed_state(
-                    self.paired_stages[1], mag_features, phase_features
-                )
-            )
-            mag_features, phase_features, _ = (
-                self._run_stage_with_compressed_state(
-                    self.paired_stages[2],
-                    mag_features,
-                    phase_features,
-                    stage2_compressed,
-                )
-            )
-            mag_features, phase_features = self._run_stage(
-                self.paired_stages[3], mag_features, phase_features
-            )
+        mag_features, phase_features = self._run_stage(
+            self.paired_stages[3], mag_features, phase_features,
+            None, mag_stage1_skip, phase_stage1_skip,
+        )
 
-        bounded_delta = self.delta_limit * torch.tanh(
+        mag_demand = torch.sigmoid(self.mag_demand_head(mag_features))
+        phase_demand = torch.sigmoid(self.phase_demand_head(phase_features))
+        raw_mag_multiplicative = self.delta_limit * torch.tanh(
             self.delta_log_mag_head(mag_features)
         )
-        raw_rotation = self.rotation_head(phase_features)
-        identity_rotation = torch.zeros_like(raw_rotation)
-        identity_rotation[:, :1] = 1.0
-        raw_rotation_norm = torch.linalg.vector_norm(
-            raw_rotation, dim=1, keepdim=True
-        )
-        rotation = torch.where(
-            raw_rotation_norm > self.eps,
-            raw_rotation / raw_rotation_norm.clamp_min(self.eps),
-            identity_rotation,
-        )
-
-        mag_gate = torch.tanh(self.outer_mag_gate)
-        phase_gate = torch.tanh(self.outer_phase_gate)
-        applied_rotation = F.normalize(
-            identity_rotation + phase_gate * (rotation - identity_rotation),
-            dim=1,
-            p=2,
-            eps=self.eps,
-        )
-        base_real, base_imag = torch.chunk(base_complex, 2, dim=1)
-        rot_real, rot_imag = torch.chunk(applied_rotation, 2, dim=1)
-        phase_complex = torch.cat((
-            base_real * rot_real - base_imag * rot_imag,
-            base_real * rot_imag + base_imag * rot_real,
-        ), dim=1)
-
-        base_mag = torch.linalg.vector_norm(base_complex, dim=1, keepdim=True)
-        applied_delta = mag_gate * bounded_delta
-        amplification = (base_mag + self.eps) * torch.expm1(applied_delta)
-        attenuation = base_mag * torch.expm1(applied_delta)
-        delta_mag = torch.where(applied_delta >= 0.0, amplification, attenuation)
-        corrected_mag = base_mag + delta_mag
-        nonzero_magnitude = base_mag > 0.0
-        safe_base_mag = torch.where(
-            nonzero_magnitude, base_mag, torch.ones_like(base_mag)
-        )
-        phase_unit = phase_complex / safe_base_mag
-        phase_unit = torch.where(nonzero_magnitude, phase_unit, applied_rotation)
-        polar_complex = phase_complex + (corrected_mag - base_mag) * phase_unit
-
-        ri_residual = torch.tanh(self.ri_residual_head(phase_features))
-        learned_gate = torch.sigmoid(self.ri_residual_gate(phase_features))
-        noisy_mag = torch.linalg.vector_norm(noisy_complex, dim=1, keepdim=True)
-        energy_gate = noisy_mag / noisy_mag.amax(
+        noisy_mag = self._complex_magnitude(noisy_complex)
+        base_mag = self._complex_magnitude(base_complex)
+        coarse_mag = self._complex_magnitude(evidence['coarse_complex'])
+        utterance_floor = self.magnitude_floor * noisy_mag.mean(
             dim=(2, 3), keepdim=True
-        ).clamp_min(self.phase_eps)
-        energy_gate = energy_gate.clamp(0.0, 1.0)
-        residual_gate = learned_gate * energy_gate
+        ).clamp_min(self.eps)
+        magnitude_reference = torch.maximum(
+            torch.maximum(noisy_mag, base_mag), coarse_mag
+        ) + utterance_floor
+        raw_mag_additive = self.additive_limit * magnitude_reference * torch.tanh(
+            self.delta_add_mag_head(mag_features)
+        )
+        applied_mag_multiplicative = mag_demand * raw_mag_multiplicative
+        applied_mag_additive = mag_demand * raw_mag_additive
+        corrected_mag = (
+            base_mag * torch.exp(applied_mag_multiplicative)
+            + applied_mag_additive
+        ).clamp_min(0.0)
+
+        raw_phase_delta = self.phase_delta_limit * torch.tanh(
+            self.phase_delta_head(phase_features)
+        )
+        applied_phase_delta = phase_demand * raw_phase_delta
+        noisy_unit = noisy_complex / noisy_mag.clamp_min(self.eps)
+        identity_unit = torch.zeros_like(noisy_complex)
+        identity_unit[:, :1] = 1.0
+        noisy_unit = torch.where(noisy_mag > self.phase_eps, noisy_unit, identity_unit)
+        base_unit = torch.where(
+            base_mag > self.phase_eps,
+            base_complex / base_mag.clamp_min(self.eps),
+            noisy_unit,
+        )
+        base_real, base_imag = torch.chunk(base_unit, 2, dim=1)
+        delta_cos = torch.cos(applied_phase_delta)
+        delta_sin = torch.sin(applied_phase_delta)
+        polar_unit = torch.cat((
+            base_real * delta_cos - base_imag * delta_sin,
+            base_real * delta_sin + base_imag * delta_cos,
+        ), dim=1)
+        polar_complex = corrected_mag * polar_unit
+
+        ri_features = self.ri_feature_fusion(
+            torch.cat((mag_features, phase_features), dim=1)
+        )
+        ri_input = torch.cat((
+            ri_features,
+            noisy_complex,
+            base_complex,
+            polar_complex,
+            noisy_complex - polar_complex,
+        ), dim=1)
+        ri_raw = torch.tanh(self.ri_residual_head(ri_input))
+        ri_demand = torch.sigmoid(self.ri_demand_head(ri_input))
+        ri_residual_ratio = self.complex_residual_max_scale * torch.sigmoid(
+            self.ri_residual_ratio_logit
+        )
         applied_ri_residual = (
-            self.complex_residual_scale * noisy_mag * residual_gate * ri_residual
+            ri_residual_ratio * magnitude_reference * ri_demand * ri_raw
         )
         refined_complex = polar_complex + applied_ri_residual
 
-        if not torch.isfinite(refined_complex).all():
-            raise RuntimeError('Asymmetric polar refiner output contains NaN/Inf.')
+        finite_outputs = {
+            'raw_mag_multiplicative': raw_mag_multiplicative,
+            'applied_mag_multiplicative': applied_mag_multiplicative,
+            'raw_mag_additive': raw_mag_additive,
+            'applied_mag_additive': applied_mag_additive,
+            'corrected_mag': corrected_mag,
+            'raw_phase_delta': raw_phase_delta,
+            'applied_phase_delta': applied_phase_delta,
+            'polar_complex': polar_complex,
+            'mag_demand': mag_demand,
+            'phase_demand': phase_demand,
+            'ri_raw': ri_raw,
+            'ri_demand': ri_demand,
+            'applied_ri_residual': applied_ri_residual,
+            'refined_complex': refined_complex,
+        }
+        for name, value in finite_outputs.items():
+            if not torch.isfinite(value).all():
+                raise RuntimeError(f'Asymmetric polar {name} contains NaN/Inf.')
 
         aux = {
             'base_complex': base_complex,
-            'delta_log_mag': bounded_delta,
-            'applied_delta_log_mag': applied_delta,
-            'applied_delta_magnitude': delta_mag,
+            'coarse_complex': evidence['coarse_complex'],
+            'raw_mag_multiplicative': raw_mag_multiplicative,
+            'applied_mag_multiplicative': applied_mag_multiplicative,
+            'raw_mag_additive': raw_mag_additive,
+            'applied_mag_additive': applied_mag_additive,
             'corrected_magnitude': corrected_mag,
-            'rotation': rotation,
-            'applied_rotation': applied_rotation,
-            'outer_mag_gate': mag_gate,
-            'outer_phase_gate': phase_gate,
-            'ri_residual': ri_residual,
-            'ri_residual_learned_gate': learned_gate,
-            'ri_residual_energy_gate': energy_gate,
-            'ri_residual_gate': residual_gate,
+            'magnitude_reference': magnitude_reference,
+            'raw_phase_delta': raw_phase_delta,
+            'applied_phase_delta': applied_phase_delta,
+            'polar_complex': polar_complex,
+            'mag_demand_gate': mag_demand,
+            'phase_demand_gate': phase_demand,
+            'ri_demand_gate': ri_demand,
+            'ri_residual_raw': ri_raw,
             'ri_residual_applied': applied_ri_residual,
+            'ri_residual_ratio': ri_residual_ratio,
+            'refined_complex': refined_complex,
             'asymmetric_mag_stage_scales': torch.stack([
                 torch.tanh(stage.mag_path.residual_scale)
                 for stage in self.paired_stages
@@ -677,5 +970,12 @@ class AsymmetricPolarZipRefine(nn.Module):
                 if self.compressed_mag_dense_bridge is not None
                 else base_complex.new_zeros(())
             ),
+            'asymmetric_context_scales': torch.stack([
+                torch.tanh(module.scale)
+                for module in (
+                    *self.full_context_injections.values(),
+                    *self.bottleneck_context_injections.values(),
+                )
+            ]),
         }
         return refined_complex, aux
