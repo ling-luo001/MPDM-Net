@@ -3,11 +3,13 @@
 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
+import math
 import os
 import time
 import argparse
 import json
 import yaml
+from contextlib import contextmanager
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -37,6 +39,82 @@ MINI_DATA_CFG = {
     'valid_clean_json': 'data/mini_val_clean_list.json',
     'valid_noisy_json': 'data/mini_val_noisy_list.json',
 }
+
+
+def _unwrap_model(model):
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+class GeneratorEMA:
+    """EMA shadow state that never replaces raw optimizer parameters."""
+
+    def __init__(self, model, decay=0.999):
+        if not 0.0 <= decay < 1.0:
+            raise ValueError('EMA decay must be in [0, 1).')
+        self.decay = float(decay)
+        self.num_updates = 0
+        core = _unwrap_model(model)
+        self.shadow = {
+            name: value.detach().clone()
+            for name, value in core.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model):
+        current = _unwrap_model(model).state_dict()
+        if current.keys() != self.shadow.keys():
+            raise RuntimeError('EMA/model state keys differ during update.')
+        for name, value in current.items():
+            shadow_value = self.shadow[name]
+            if torch.is_floating_point(shadow_value):
+                shadow_value.mul_(self.decay).add_(
+                    value.detach(), alpha=1.0 - self.decay
+                )
+            else:
+                shadow_value.copy_(value.detach())
+        self.num_updates += 1
+
+    def state_dict(self):
+        return {
+            'decay': self.decay,
+            'num_updates': self.num_updates,
+            'shadow': {
+                name: value.detach().clone()
+                for name, value in self.shadow.items()
+            },
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict) or 'shadow' not in state:
+            raise ValueError('EMA checkpoint must contain a shadow state.')
+        incoming = state['shadow']
+        if incoming.keys() != self.shadow.keys():
+            raise RuntimeError('EMA checkpoint/model state keys differ.')
+        for name, value in incoming.items():
+            target = self.shadow[name]
+            if target.shape != value.shape:
+                raise RuntimeError(
+                    f'EMA tensor shape mismatch for {name}: '
+                    f'{tuple(value.shape)} != {tuple(target.shape)}.'
+                )
+            target.copy_(value.detach().to(device=target.device, dtype=target.dtype))
+        self.decay = float(state.get('decay', self.decay))
+        if not 0.0 <= self.decay < 1.0:
+            raise ValueError('EMA checkpoint decay must be in [0, 1).')
+        self.num_updates = int(state.get('num_updates', 0))
+
+    @contextmanager
+    def average_parameters(self, model):
+        core = _unwrap_model(model)
+        raw_state = {
+            name: value.detach().clone()
+            for name, value in core.state_dict().items()
+        }
+        core.load_state_dict(self.shadow, strict=True)
+        try:
+            yield core
+        finally:
+            core.load_state_dict(raw_state, strict=True)
 
 
 def harmonic_generation_losses(generator, clean_mag, clean_com):
@@ -204,27 +282,29 @@ def _is_no_weight_decay_parameter(name, parameter):
         return True
     lowered = name.lower()
     return (
-        name.endswith('.bias')
+        lowered.endswith('bias')
         or '.norm' in lowered
         or 'normalization' in lowered
-        or 'gate' in lowered
-        or 'scale' in lowered
+        or 'x_proj_weight' in lowered
+        or 'dt_projs_weight' in lowered
         or 'a_log' in lowered
         or 'a_logs' in lowered
     )
 
 
 def _is_refiner_head_parameter(name):
-    lowered = name.lower()
-    return any(token in lowered for token in (
-        'demand',
-        'delta_log_mag_head',
-        'additive_mag',
-        'phase_delta',
-        'rotation_head',
-        'ri_residual',
-        'complex_residual',
-    ))
+    marker = 'asymmetric_polar_zip_refiner.'
+    relative = name.split(marker, 1)[-1]
+    head_modules = (
+        'delta_log_mag_head.',
+        'delta_add_mag_head.',
+        'phase_delta_head.',
+        'mag_demand_head.',
+        'phase_demand_head.',
+        'ri_residual_head.3.',
+        'ri_demand_head.',
+    )
+    return relative.startswith(head_modules)
 
 
 def _generator_parameter_groups(generator, cfg):
@@ -321,7 +401,7 @@ def setup_schedulers(optimizers, cfg, last_epoch):
     return scheduler_g, scheduler_d
 
 
-def update_refiner_anchor_alpha(generator, steps, cfg):
+def update_refiner_anchor_alpha(generator, steps, cfg, fractional_epoch=None):
     """Blend identity and joint-refiner VJPs without changing forward values."""
     if getattr(generator, 'asymmetric_polar_zip_refiner', None) is None:
         return 1.0
@@ -332,17 +412,68 @@ def update_refiner_anchor_alpha(generator, steps, cfg):
     end = float(
         model_cfg.get('asymmetric_polar_zip_refine_anchor_alpha_end', 1.0)
     )
-    schedule_steps = int(
-        model_cfg.get('asymmetric_polar_zip_refine_anchor_schedule_steps', 20000)
-    )
     if not 0.0 <= start <= 1.0 or not 0.0 <= end <= 1.0:
         raise ValueError('Refiner anchor alpha endpoints must be in [0, 1].')
-    if schedule_steps < 0:
-        raise ValueError('Refiner anchor schedule steps must be non-negative.')
-    progress = 1.0 if schedule_steps == 0 else min(1.0, steps / schedule_steps)
+    schedule_epochs = model_cfg.get(
+        'asymmetric_polar_zip_refine_anchor_schedule_epochs'
+    )
+    if schedule_epochs is not None:
+        schedule_epochs = float(schedule_epochs)
+        if schedule_epochs < 0.0:
+            raise ValueError('Refiner anchor schedule epochs must be non-negative.')
+        if fractional_epoch is None:
+            raise ValueError('Fractional epoch is required by the anchor schedule.')
+        progress = (
+            1.0 if schedule_epochs == 0.0
+            else min(1.0, max(0.0, float(fractional_epoch)) / schedule_epochs)
+        )
+    else:
+        schedule_steps = int(
+            model_cfg.get('asymmetric_polar_zip_refine_anchor_schedule_steps', 20000)
+        )
+        if schedule_steps < 0:
+            raise ValueError('Refiner anchor schedule steps must be non-negative.')
+        progress = 1.0 if schedule_steps == 0 else min(1.0, steps / schedule_steps)
     alpha = start + (end - start) * progress
     generator.set_asymmetric_refiner_anchor_alpha(alpha)
     return alpha
+
+
+def refiner_intermediate_loss_multipliers(fractional_epoch, cfg):
+    """Epoch-based V3 direct-supervision taper with a legacy all-one fallback."""
+    names = (
+        'base_complex', 'magnitude', 'phase', 'polar_complex',
+        'ri_residual', 'demand',
+    )
+    schedule = cfg['training_cfg'].get('refiner_intermediate_schedule')
+    if schedule is None:
+        return {name: 1.0 for name in names}
+    full_until = float(schedule.get('full_weight_until_epoch', 10.0))
+    taper_until = float(schedule.get('taper_until_epoch', 30.0))
+    if full_until < 0.0 or taper_until <= full_until:
+        raise ValueError('Invalid refiner intermediate supervision epoch bounds.')
+    final = {
+        'base_complex': float(schedule.get('final_base_complex', 0.0)),
+        'magnitude': float(schedule.get('final_magnitude', 0.30)),
+        'phase': float(schedule.get('final_phase', 1.0 / 3.0)),
+        'polar_complex': float(schedule.get('final_polar_complex', 0.0)),
+        'ri_residual': float(schedule.get('final_ri_residual', 0.0)),
+        'demand': float(schedule.get('final_demand', 0.0)),
+    }
+    if any(not 0.0 <= value <= 1.0 for value in final.values()):
+        raise ValueError('Refiner intermediate supervision multipliers must be in [0, 1].')
+    epoch = max(0.0, float(fractional_epoch))
+    if epoch <= full_until:
+        blend = 1.0
+    elif epoch >= taper_until:
+        blend = 0.0
+    else:
+        progress = (epoch - full_until) / (taper_until - full_until)
+        blend = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return {
+        name: final[name] + (1.0 - final[name]) * blend
+        for name in names
+    }
 
 
 def clip_generator_gradients(generator, cfg):
@@ -483,6 +614,100 @@ def create_dataloader(dataset, cfg, train=True):
     )
 
 
+def validate_generator(
+    generator, validation_loader, cfg, device, n_fft, hop_size, win_size,
+    compress_factor,
+):
+    """Run the existing validation membership and metrics for one model state."""
+    generator.eval()
+    torch.cuda.empty_cache()
+    audios_r, audios_g = [], []
+    val_mag_err_tot = 0.0
+    val_pha_err_tot = 0.0
+    val_com_err_tot = 0.0
+    with torch.no_grad():
+        for j, batch in enumerate(validation_loader):
+            clean_audio, clean_mag, clean_pha, clean_com, noisy_audio = batch
+            clean_audio = clean_audio.to(device, non_blocking=True)
+            clean_mag = clean_mag.to(device, non_blocking=True)
+            clean_pha = clean_pha.to(device, non_blocking=True)
+            clean_com = clean_com.to(device, non_blocking=True)
+            noisy_audio = noisy_audio.to(device, non_blocking=True)
+            orig_size = noisy_audio.size(1)
+
+            if noisy_audio.size(1) >= cfg['training_cfg']['segment_size']:
+                last_segment_size = (
+                    noisy_audio.size(1) % cfg['training_cfg']['segment_size']
+                )
+                if last_segment_size > 0:
+                    last_segment = noisy_audio[
+                        :, -cfg['training_cfg']['segment_size']:
+                    ]
+                    noisy_audio = noisy_audio[:, :-last_segment_size]
+                    segments = list(torch.split(
+                        noisy_audio, cfg['training_cfg']['segment_size'], dim=1
+                    ))
+                    segments.append(last_segment)
+                    reshape_last = True
+                else:
+                    segments = torch.split(
+                        noisy_audio, cfg['training_cfg']['segment_size'], dim=1
+                    )
+                    reshape_last = False
+            else:
+                padded_zeros = torch.zeros(
+                    1,
+                    cfg['training_cfg']['segment_size'] - noisy_audio.size(1),
+                    device=device,
+                )
+                segments = [torch.cat((noisy_audio, padded_zeros), dim=1)]
+                reshape_last = False
+
+            processed_segments = []
+            for segment_index, segment in enumerate(segments):
+                noisy_amp, noisy_pha, _ = mag_phase_stft(
+                    segment, n_fft, hop_size, win_size, compress_factor
+                )
+                amp_g, pha_g, _ = generator(
+                    noisy_amp.to(device, non_blocking=True),
+                    noisy_pha.to(device, non_blocking=True),
+                )
+                audio_g = mag_phase_istft(
+                    amp_g, pha_g, n_fft, hop_size, win_size, compress_factor
+                ).squeeze()
+                if reshape_last and segment_index == len(segments) - 2:
+                    audio_g = audio_g[:- (
+                        cfg['training_cfg']['segment_size'] - last_segment_size
+                    )]
+                processed_segments.append(audio_g)
+
+            audio_g = torch.cat(processed_segments, dim=-1)[:orig_size]
+            mag_g, pha_g, com_g = mag_phase_stft(
+                audio_g, n_fft, hop_size, win_size, compress_factor
+            )
+            mag_g = mag_g.to(device, non_blocking=True).squeeze()
+            pha_g = pha_g.to(device, non_blocking=True).unsqueeze(0)
+            com_g = com_g.to(device, non_blocking=True)
+            clean_mag = clean_mag.squeeze()
+            clean_com = clean_com.squeeze()
+            audios_r += torch.split(clean_audio, 1, dim=0)
+            audios_g += torch.split(audio_g.unsqueeze(0), 1, dim=0)
+            val_mag_err_tot += F.mse_loss(clean_mag, mag_g).item()
+            val_ip_err, val_gd_err, val_iaf_err = phase_losses(
+                clean_pha, pha_g, cfg
+            )
+            val_pha_err_tot += (val_ip_err + val_gd_err + val_iaf_err).item()
+            val_com_err_tot += F.mse_loss(clean_com, com_g).item()
+
+    batches = j + 1
+    return {
+        'pesq': pesq_score(audios_r, audios_g, cfg).item(),
+        'magnitude': val_mag_err_tot / batches,
+        'phase': val_pha_err_tot / batches,
+        'complex': val_com_err_tot / batches,
+    }
+
+
 def train(rank, args, cfg):
     num_gpus = cfg['env_setting']['num_gpus']
     n_fft, hop_size, win_size = cfg['stft_cfg']['n_fft'], cfg['stft_cfg']['hop_size'], cfg['stft_cfg']['win_size']
@@ -512,6 +737,22 @@ def train(rank, args, cfg):
         load_parent_initialization(
             generator, args.init_parent_checkpoint, device, cfg
         )
+
+    ema_cfg = cfg['training_cfg'].get('ema', {})
+    ema_enabled = bool(ema_cfg.get('enabled', False))
+    generator_ema = (
+        GeneratorEMA(generator, decay=float(ema_cfg.get('decay', 0.999)))
+        if ema_enabled else None
+    )
+    if generator_ema is not None and state_dict_g is not None:
+        ema_state = state_dict_g.get('generator_ema')
+        if ema_state is not None:
+            generator_ema.load_state_dict(ema_state)
+        else:
+            warnings.warn(
+                'Resume checkpoint has no EMA state; EMA starts from raw generator.',
+                UserWarning,
+            )
 
     if num_gpus > 1 and torch.cuda.is_available():
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
@@ -591,8 +832,9 @@ def train(rank, args, cfg):
             noisy_pha = torch.autograd.Variable(noisy_pha.to(device, non_blocking=True))
             one_labels = torch.ones(batch_size).to(device, non_blocking=True)
 
+            fractional_epoch = epoch + i / max(1, len(train_loader))
             anchor_alpha = update_refiner_anchor_alpha(
-                generator_core, steps, cfg
+                generator_core, steps, cfg, fractional_epoch=fractional_epoch
             )
             mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
 
@@ -651,6 +893,9 @@ def train(rank, args, cfg):
                 generator_core, clean_mag, clean_com
             )
             loss_cfg = cfg['training_cfg']['loss']
+            refiner_loss_multipliers = refiner_intermediate_loss_multipliers(
+                fractional_epoch, cfg
+            )
 
             loss_gen_all = (
                 loss_metric * loss_cfg['metric'] +
@@ -663,18 +908,33 @@ def train(rank, args, cfg):
                 auxiliary_losses['pitch'] * loss_cfg['pitch'] +
                 auxiliary_losses['voicing'] * loss_cfg['voicing'] +
                 auxiliary_losses['harmonic_support'] * loss_cfg['harmonic_support'] +
-                refiner_losses['base_complex'] * loss_cfg.get('refiner_base_complex', 0.0) +
-                refiner_losses['magnitude'] * loss_cfg.get('refiner_magnitude', 0.0) +
-                refiner_losses['phase'] * loss_cfg.get('refiner_phase', 0.0) +
-                refiner_losses['polar_complex'] * loss_cfg.get('refiner_polar_complex', 0.0) +
-                refiner_losses['ri_residual'] * loss_cfg.get('refiner_ri_residual', 0.0) +
+                refiner_losses['base_complex'] * loss_cfg.get('refiner_base_complex', 0.0)
+                * refiner_loss_multipliers['base_complex'] +
+                refiner_losses['magnitude'] * loss_cfg.get('refiner_magnitude', 0.0)
+                * refiner_loss_multipliers['magnitude'] +
+                refiner_losses['phase'] * loss_cfg.get('refiner_phase', 0.0)
+                * refiner_loss_multipliers['phase'] +
+                refiner_losses['polar_complex'] * loss_cfg.get('refiner_polar_complex', 0.0)
+                * refiner_loss_multipliers['polar_complex'] +
+                refiner_losses['ri_residual'] * loss_cfg.get('refiner_ri_residual', 0.0)
+                * refiner_loss_multipliers['ri_residual'] +
                 refiner_losses['demand'] * loss_cfg.get('refiner_demand', 0.0)
+                * refiner_loss_multipliers['demand']
             )
 
             loss_gen_all.backward()
             gradient_norms = clip_generator_gradients(generator_core, cfg)
             optim_g.step()
+            if generator_ema is not None:
+                generator_ema.update(generator_core)
             # ------------------------------------------------------- #
+
+            validation_due = (
+                steps % cfg['env_setting']['validation_interval'] == 0
+                and steps != 0
+            )
+            if num_gpus > 1 and validation_due:
+                torch.distributed.barrier()
 
             if rank == 0:
                 # STDOUT logging
@@ -752,7 +1012,11 @@ def train(rank, args, cfg):
                     save_checkpoint(
                         exp_name,
                         {
-                            'generator': (generator.module if num_gpus > 1 else generator).state_dict()
+                            'generator': generator_core.state_dict(),
+                            **(
+                                {'generator_ema': generator_ema.state_dict()}
+                                if generator_ema is not None else {}
+                            ),
                         }
                     )
                     exp_name = f"{args.exp_path}/do_{steps:08d}.pth"
@@ -835,8 +1099,12 @@ def train(rank, args, cfg):
                                 steps,
                             )
                         interaction_scales = torch.cat((
-                            aux_snapshot['asymmetric_interaction_mag_scales'],
-                            aux_snapshot['asymmetric_interaction_phase_scales'],
+                            aux_snapshot[
+                                'asymmetric_interaction_mag_scales'
+                            ].reshape(-1),
+                            aux_snapshot[
+                                'asymmetric_interaction_phase_scales'
+                            ].reshape(-1),
                         ))
                         applied_delta_abs = aux_snapshot[
                             'applied_mag_multiplicative'
@@ -855,6 +1123,15 @@ def train(rank, args, cfg):
                             "Training/Asymmetric Interaction Scale",
                             interaction_scales.abs().mean().item(),
                             steps
+                        )
+                        upskip_scales = torch.cat((
+                            aux_snapshot['asymmetric_upskip_mag_scale'],
+                            aux_snapshot['asymmetric_upskip_phase_scale'],
+                        ))
+                        sw.add_scalar(
+                            "Training/Asymmetric UpSkip Scale",
+                            upskip_scales.abs().mean().item(),
+                            steps,
                         )
                         sw.add_scalar(
                             "Training/Asymmetric Dense Bridge Scale",
@@ -915,6 +1192,12 @@ def train(rank, args, cfg):
                         sw.add_scalar(
                             "Training/Asymmetric Anchor Alpha", anchor_alpha, steps
                         )
+                        for loss_name, multiplier in refiner_loss_multipliers.items():
+                            sw.add_scalar(
+                                f"Training/Asymmetric Direct {loss_name.replace('_', ' ').title()} Multiplier",
+                                multiplier,
+                                steps,
+                            )
                         sw.add_scalar(
                             "Training/Parent Gradient Norm",
                             gradient_norms['parent'],
@@ -931,7 +1214,7 @@ def train(rank, args, cfg):
                     raise ValueError("NaN values found in loss_gen_all")
 
                 # Validation
-                if steps % cfg['env_setting']['validation_interval'] == 0 and steps != 0:
+                if validation_due:
                     generator.eval()
                     torch.cuda.empty_cache()
                     audios_r, audios_g = [], []
@@ -1030,19 +1313,75 @@ def train(rank, args, cfg):
                         val_pesq_score = pesq_score(audios_r, audios_g, cfg).item()
                         print('Steps : {:d}, PESQ Score: {:4.3f}, s/b : {:4.3f}'.
                                 format(steps, val_pesq_score, time.time() - start_b))
-                        sw.add_scalar("Validation/PESQ Score", val_pesq_score, steps)
-                        sw.add_scalar("Validation/Magnitude Loss", val_mag_err, steps)
-                        sw.add_scalar("Validation/Phase Loss", val_pha_err, steps)
-                        sw.add_scalar("Validation/Complex Loss", val_com_err, steps)
+                        sw.add_scalar(
+                            "Validation/Raw/PESQ Score", val_pesq_score, steps
+                        )
+                        sw.add_scalar(
+                            "Validation/Raw/Magnitude Loss", val_mag_err, steps
+                        )
+                        sw.add_scalar(
+                            "Validation/Raw/Phase Loss", val_pha_err, steps
+                        )
+                        sw.add_scalar(
+                            "Validation/Raw/Complex Loss", val_com_err, steps
+                        )
 
                     generator.train()
 
-                    # Print best validation PESQ score in terminal
-                    if val_pesq_score >= best_pesq:
-                        best_pesq = val_pesq_score
-                        best_pesq_step = steps
-                    print(f"valid: PESQ {val_pesq_score}, Mag_loss {val_mag_err}, Phase_loss {val_pha_err}. Best_PESQ: {best_pesq} at step {best_pesq_step}")
+                    selection_name = 'Raw'
+                    selected_pesq = val_pesq_score
+                    selected_mag = val_mag_err
+                    selected_phase = val_pha_err
+                    selected_complex = val_com_err
+                    if generator_ema is not None:
+                        with generator_ema.average_parameters(generator_core):
+                            ema_metrics = validate_generator(
+                                generator, validation_loader, cfg, device,
+                                n_fft, hop_size, win_size, compress_factor,
+                            )
+                        ema_metric_tags = {
+                            'pesq': 'PESQ Score',
+                            'magnitude': 'Magnitude Loss',
+                            'phase': 'Phase Loss',
+                            'complex': 'Complex Loss',
+                        }
+                        for metric_name, value in ema_metrics.items():
+                            sw.add_scalar(
+                                f'Validation/EMA/{ema_metric_tags[metric_name]}',
+                                value,
+                                steps,
+                            )
+                        print(
+                            f'Steps : {steps:d}, EMA PESQ Score: '
+                            f'{ema_metrics["pesq"]:4.3f}, s/b : '
+                            f'{time.time() - start_b:4.3f}'
+                        )
+                        selection_name = 'EMA'
+                        selected_pesq = ema_metrics['pesq']
+                        selected_mag = ema_metrics['magnitude']
+                        selected_phase = ema_metrics['phase']
+                        selected_complex = ema_metrics['complex']
+                        generator.train()
 
+                    # Keep the established tags as the score-selection stream so
+                    # existing result-audit scripts continue to see V3 runs.
+                    sw.add_scalar("Validation/PESQ Score", selected_pesq, steps)
+                    sw.add_scalar("Validation/Magnitude Loss", selected_mag, steps)
+                    sw.add_scalar("Validation/Phase Loss", selected_phase, steps)
+                    sw.add_scalar("Validation/Complex Loss", selected_complex, steps)
+
+                    # Print best validation PESQ score in terminal
+                    if selected_pesq >= best_pesq:
+                        best_pesq = selected_pesq
+                        best_pesq_step = steps
+                    print(
+                        f'valid[{selection_name}]: PESQ {selected_pesq}, '
+                        f'Mag_loss {selected_mag}, Phase_loss {selected_phase}. '
+                        f'Best_PESQ: {best_pesq} at step {best_pesq_step}'
+                    )
+
+            if num_gpus > 1 and validation_due:
+                torch.distributed.barrier()
             steps += 1
 
         scheduler_g.step()
@@ -1055,13 +1394,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
     parser.add_argument(
-        '--exp_name', default='rd_asymmetric_polar_demand_v2_full_seed1234'
+        '--exp_name', default='rd_asymmetric_polar_demand_v3_full_seed1234'
     )
     parser.add_argument(
         '--config',
         default=(
-            'recipes/RD-Asymmetric-Polar-Demand-V2/'
-            'RD-Asymmetric-Polar-Demand-V2.yaml'
+            'recipes/RD-Asymmetric-Polar-Demand-V3/'
+            'RD-Asymmetric-Polar-Demand-V3.yaml'
         ),
     )
     parser.add_argument('--resume_from', default=None,

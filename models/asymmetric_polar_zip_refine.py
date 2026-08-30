@@ -126,6 +126,30 @@ class _ChannelLayerNorm(nn.Module):
         ).permute(0, 3, 1, 2).contiguous()
 
 
+class _BoundedChannelLayerScale(nn.Module):
+    """Per-channel residual scale with a hard, inspectable magnitude budget."""
+
+    def __init__(self, channels, initial_scale, max_scale):
+        super().__init__()
+        if not 0.0 <= abs(initial_scale) < max_scale:
+            raise ValueError('LayerScale initialization must be inside its budget.')
+        self.channels = int(channels)
+        self.max_scale = float(max_scale)
+        initial_logit = math.atanh(float(initial_scale) / self.max_scale)
+        self.logit = nn.Parameter(torch.full((self.channels,), initial_logit))
+        self.logit._no_weight_decay = True
+
+    def values(self):
+        return self.max_scale * torch.tanh(self.logit)
+
+    def forward(self, residual):
+        if residual.ndim != 4 or residual.shape[1] != self.channels:
+            raise ValueError(
+                f'Expected [B, {self.channels}, H, W], got {tuple(residual.shape)}.'
+            )
+        return self.values().view(1, -1, 1, 1) * residual
+
+
 def _init_small(module, std=1e-3, bias=0.0):
     nn.init.normal_(module.weight, mean=0.0, std=std)
     if module.bias is not None:
@@ -178,6 +202,9 @@ class _UpSkipTransition(nn.Module):
             _ChannelLayerNorm(channels),
             nn.GELU(),
         )
+        self.layer_scale = _BoundedChannelLayerScale(
+            channels, initial_scale=0.10, max_scale=1.0
+        )
 
     def forward(self, features, skip):
         features = self.up(features, output_size=skip.shape)
@@ -186,7 +213,8 @@ class _UpSkipTransition(nn.Module):
                 f'Full-resolution skip mismatch: {tuple(features.shape)} != '
                 f'{tuple(skip.shape)}.'
             )
-        return self.fuse(torch.cat((features, skip), dim=1))
+        fused = self.fuse(torch.cat((features, skip), dim=1))
+        return skip + self.layer_scale(fused)
 
 
 class _LatentInjection(nn.Module):
@@ -225,7 +253,6 @@ class _ProjectedCrossInteraction(nn.Module):
         phase_channels,
         common_channels,
         d_state,
-        gate_bias,
     ):
         super().__init__()
         self.common_channels = int(common_channels)
@@ -249,10 +276,6 @@ class _ProjectedCrossInteraction(nn.Module):
             d_conv=3,
             dropout=0.0,
         )
-        self.mag_cross_gate = nn.Conv2d(common_channels * 2, common_channels, 1)
-        self.phase_cross_gate = nn.Conv2d(common_channels * 2, common_channels, 1)
-        _init_small(self.mag_cross_gate, bias=gate_bias)
-        _init_small(self.phase_cross_gate, bias=gate_bias)
         self.mag_eca = eca_layer(common_channels)
         self.phase_eca = eca_layer(common_channels)
         self.mag_calibration = _ChannelLayerNorm(common_channels)
@@ -263,36 +286,33 @@ class _ProjectedCrossInteraction(nn.Module):
         self.phase_back_projection = nn.Conv2d(
             common_channels, phase_channels, 1, bias=False
         )
-        self.mag_scale = _scale_parameter(0.05)
-        self.phase_scale = _scale_parameter(0.05)
+        self.mag_layer_scale = _BoundedChannelLayerScale(
+            mag_channels, initial_scale=0.03, max_scale=0.25
+        )
+        self.phase_layer_scale = _BoundedChannelLayerScale(
+            phase_channels, initial_scale=0.03, max_scale=0.25
+        )
 
     def forward(self, mag_features, phase_features):
         mag_common = self.mag_projection(mag_features)
         phase_common = self.phase_projection(phase_features)
         mag_common = mag_common + self.mag_local(mag_common)
         phase_common = phase_common + self.phase_local(phase_common)
-        mag_cross, phase_cross = self.cross(
+        mag_scan, phase_scan = self.cross(
             self.mag_norm(mag_common.permute(0, 2, 3, 1)),
             self.phase_norm(phase_common.permute(0, 2, 3, 1)),
         )
-        mag_cross = mag_cross.permute(0, 3, 1, 2)
-        phase_cross = phase_cross.permute(0, 3, 1, 2)
-        joint = torch.cat((mag_cross, phase_cross), dim=1)
-        mag_mixed = mag_cross + torch.sigmoid(
-            self.mag_cross_gate(joint)
-        ) * phase_cross
-        phase_mixed = phase_cross + torch.sigmoid(
-            self.phase_cross_gate(joint)
-        ) * mag_cross
+        mag_scan = mag_scan.permute(0, 3, 1, 2)
+        phase_scan = phase_scan.permute(0, 3, 1, 2)
         mag_update = self.mag_back_projection(
-            self.mag_calibration(self.mag_eca(mag_mixed))
+            self.mag_calibration(self.mag_eca(phase_scan))
         )
         phase_update = self.phase_back_projection(
-            self.phase_calibration(self.phase_eca(phase_mixed))
+            self.phase_calibration(self.phase_eca(mag_scan))
         )
         return (
-            mag_features + torch.tanh(self.mag_scale) * mag_update,
-            phase_features + torch.tanh(self.phase_scale) * phase_update,
+            mag_features + self.mag_layer_scale(mag_update),
+            phase_features + self.phase_layer_scale(phase_update),
         )
 
 
@@ -368,11 +388,6 @@ class _PairedStage(nn.Module):
                 phase_channels,
                 common_channels,
                 d_state=int(cfg['model_cfg']['d_state']),
-                gate_bias=float(
-                    cfg['model_cfg'].get(
-                        'asymmetric_polar_zip_refine_interaction_gate_bias', -2.0
-                    )
-                ),
             )
         self.interaction_position = (
             'none' if self.interaction is None
@@ -467,20 +482,12 @@ class AsymmetricPolarZipRefine(nn.Module):
         self.phase_delta_limit = float(
             model_cfg.get('asymmetric_polar_zip_refine_phase_delta_limit', 1.0)
         )
-        self.complex_residual_scale = float(
-            model_cfg.get(
-                'asymmetric_polar_zip_refine_initial_complex_residual_scale',
-                model_cfg.get(
-                    'asymmetric_polar_zip_refine_complex_residual_scale', 0.1
-                ),
-            )
+        self.ri_residual_ratio = float(
+            model_cfg.get('asymmetric_polar_zip_refine_ri_residual_ratio', 0.25)
         )
-        self.complex_residual_max_scale = float(
+        self.noisy_reference_absorption = float(
             model_cfg.get(
-                'asymmetric_polar_zip_refine_max_complex_residual_scale',
-                model_cfg.get(
-                    'asymmetric_polar_zip_refine_complex_residual_max_scale', 0.5
-                ),
+                'asymmetric_polar_zip_refine_noisy_reference_absorption', 0.25
             )
         )
         self.context_initial_scale = float(
@@ -521,10 +528,12 @@ class AsymmetricPolarZipRefine(nn.Module):
             raise ValueError('Magnitude additive limit and floor must be positive.')
         if not 0.0 < self.phase_delta_limit <= math.pi:
             raise ValueError('phase_delta_limit must be in (0, pi].')
-        if not 0.0 < self.complex_residual_scale < self.complex_residual_max_scale:
+        if not 0.0 < self.ri_residual_ratio <= 0.25:
             raise ValueError(
-                'The RI initial ratio must be positive and below its maximum.'
+                'The fixed RI residual ratio must be in (0, 0.25].'
             )
+        if not 0.0 <= self.noisy_reference_absorption <= 0.25:
+            raise ValueError('Noisy reference absorption must be in [0, 0.25].')
         if not 0.0 < self.context_initial_scale < 1.0:
             raise ValueError('Refiner context scale must be in (0, 1).')
         if not self.persistent_backbone:
@@ -642,10 +651,6 @@ class AsymmetricPolarZipRefine(nn.Module):
         self.ri_demand_head = nn.Conv2d(ri_input_channels, 1, 1)
         _init_small(self.ri_residual_head[-1])
         _init_small(self.ri_demand_head, bias=self.demand_gate_bias)
-        residual_fraction = self.complex_residual_scale / self.complex_residual_max_scale
-        self.ri_residual_ratio_logit = nn.Parameter(torch.tensor(
-            math.log(residual_fraction / (1.0 - residual_fraction))
-        ))
 
     @property
     def outer_mag_gate(self):
@@ -851,9 +856,11 @@ class AsymmetricPolarZipRefine(nn.Module):
         utterance_floor = self.magnitude_floor * noisy_mag.mean(
             dim=(2, 3), keepdim=True
         ).clamp_min(self.eps)
-        magnitude_reference = torch.maximum(
-            torch.maximum(noisy_mag, base_mag), coarse_mag
-        ) + utterance_floor
+        trusted_magnitude_reference = torch.maximum(base_mag, coarse_mag) + utterance_floor
+        magnitude_reference = trusted_magnitude_reference + (
+            self.noisy_reference_absorption
+            * torch.relu(noisy_mag - trusted_magnitude_reference)
+        )
         raw_mag_additive = self.additive_limit * magnitude_reference * torch.tanh(
             self.delta_add_mag_head(mag_features)
         )
@@ -898,9 +905,7 @@ class AsymmetricPolarZipRefine(nn.Module):
         ), dim=1)
         ri_raw = torch.tanh(self.ri_residual_head(ri_input))
         ri_demand = torch.sigmoid(self.ri_demand_head(ri_input))
-        ri_residual_ratio = self.complex_residual_max_scale * torch.sigmoid(
-            self.ri_residual_ratio_logit
-        )
+        ri_residual_ratio = polar_complex.new_tensor(self.ri_residual_ratio)
         applied_ri_residual = (
             ri_residual_ratio * magnitude_reference * ri_demand * ri_raw
         )
@@ -934,6 +939,7 @@ class AsymmetricPolarZipRefine(nn.Module):
             'raw_mag_additive': raw_mag_additive,
             'applied_mag_additive': applied_mag_additive,
             'corrected_magnitude': corrected_mag,
+            'trusted_magnitude_reference': trusted_magnitude_reference,
             'magnitude_reference': magnitude_reference,
             'raw_phase_delta': raw_phase_delta,
             'applied_phase_delta': applied_phase_delta,
@@ -954,15 +960,21 @@ class AsymmetricPolarZipRefine(nn.Module):
                 for stage in self.paired_stages
             ]),
             'asymmetric_interaction_mag_scales': torch.stack([
-                torch.tanh(stage.interaction.mag_scale)
+                stage.interaction.mag_layer_scale.values()
                 for stage in self.paired_stages
                 if stage.interaction is not None
             ]),
             'asymmetric_interaction_phase_scales': torch.stack([
-                torch.tanh(stage.interaction.phase_scale)
+                stage.interaction.phase_layer_scale.values()
                 for stage in self.paired_stages
                 if stage.interaction is not None
             ]),
+            'asymmetric_upskip_mag_scale': (
+                self.paired_stages[3].mag_up.layer_scale.values()
+            ),
+            'asymmetric_upskip_phase_scale': (
+                self.paired_stages[3].phase_up.layer_scale.values()
+            ),
             'asymmetric_dense_bridge_scale': (
                 torch.tanh(
                     self.compressed_mag_dense_bridge.residual_scale
